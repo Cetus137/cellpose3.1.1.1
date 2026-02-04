@@ -1,0 +1,36 @@
+# Core dependencies
+numpy>=1.20.0,<2.1
+scipy
+natsort
+tifffile
+tqdm
+numba>=0.53.0
+llvmlite
+torch>=1.6
+opencv-python-headless
+fastremap
+imagecodecs
+roifile
+
+# Image format support
+nd2
+pynrrd
+
+# GUI dependencies (optional)
+# pyqtgraph>=0.11.0rc0
+# pyqt6
+# pyqt6.sip
+# qtpy
+# superqt
+
+# Distributed computing (optional)
+# dask
+# distributed
+# dask_image
+# pyyaml
+# zarr
+# dask_jobqueue
+# bokeh
+
+# BioImage.IO support (optional)
+# bioimageio.core
