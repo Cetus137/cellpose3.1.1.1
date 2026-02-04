@@ -6,40 +6,231 @@ from cellpose.transforms import normalize_img
 from pathlib import Path
 import torch
 from torch import nn
+import torch.nn.functional as F
 from tqdm import trange
 from numba import prange
+from scipy.ndimage import binary_dilation, binary_erosion
 
 import logging
 
 train_logger = logging.getLogger(__name__)
 
 
-def _loss_fn_seg(lbl, y, device):
+def make_boundary_gt(instance_mask, mean_diameter=30.0, debug=False, dilation_pixels=5, smooth_sigma=2.0):
+    """
+    Generate binary boundary ring ground truth from cell core masks.
+    
+    Strategy:
+    1. For each cell instance, dilate by fixed number of pixels
+    2. Boundary = dilated AND NOT original (creates outer ring only)
+    3. Combine all boundaries into single binary map
+    4. Apply Gaussian smoothing for softer targets
+    
+    Args:
+        instance_mask (numpy.ndarray): Instance mask (H, W) with unique integer per cell (0=background)
+        mean_diameter (float): Mean cell diameter (unused, kept for API compatibility)
+        debug (bool): Print debug info
+        dilation_pixels (int): Number of pixels to dilate for boundary ring (default: 5)
+        smooth_sigma (float): Gaussian smoothing sigma for boundary GT (default: 2.0)
+    
+    Returns:
+        tuple: (boundary_map, training_mask)
+            - boundary_map (numpy.ndarray): Smoothed boundary map in [0,1], shape (H, W), dtype float32
+                                            1.0 = boundary center, 0.0 = far from boundary
+            - training_mask (numpy.ndarray): Boolean mask for training area (all True), shape (H, W), dtype bool
+    """
+    from scipy.ndimage import binary_dilation, binary_erosion, gaussian_filter
+    
+    # Debug: check input
+    if debug:
+        print(f"[make_boundary_gt] INPUT: shape={instance_mask.shape}, dtype={instance_mask.dtype}, min={instance_mask.min()}, max={instance_mask.max()}, unique={len(np.unique(instance_mask))}")
+    
+    if instance_mask.size == 0:
+        print(f"WARNING: make_boundary_gt received empty mask")
+        empty_target = np.zeros_like(instance_mask, dtype=np.float32)
+        empty_mask = np.ones_like(instance_mask, dtype=bool)  # Train everywhere (all zeros)
+        return empty_target, empty_mask
+    
+    if instance_mask.max() == 0:
+        print(f"WARNING: make_boundary_gt received all-zero mask (shape={instance_mask.shape})")
+        empty_target = np.zeros_like(instance_mask, dtype=np.float32)
+        empty_mask = np.ones_like(instance_mask, dtype=bool)  # Train everywhere (all zeros)
+        return empty_target, empty_mask
+    
+    # Initialize binary boundary map
+    boundary_map = np.zeros_like(instance_mask, dtype=bool)
+    
+    if debug:
+        print(f"[make_boundary_gt] Fixed dilation: {dilation_pixels} pixels")
+    
+    # Process each cell individually with fixed dilation
+    cell_ids = np.unique(instance_mask)
+    cell_ids = cell_ids[cell_ids > 0]  # Exclude background
+    
+    for cell_id in cell_ids:
+        # Get mask for this cell
+        cell_mask = (instance_mask == cell_id)
+        
+        # Fixed dilation for all cells
+        dilated = binary_dilation(cell_mask, iterations=dilation_pixels)
+        
+        # Boundary ring = dilated AND NOT original (creates outer ring only)
+        boundary_ring = dilated & ~cell_mask
+        
+        # Add this cell's boundary to the combined map
+        boundary_map |= boundary_ring
+    
+    # Convert to float32 for training
+    boundary_map_float = boundary_map.astype(np.float32)
+    
+    # Apply Gaussian smoothing for softer targets
+    if smooth_sigma > 0:
+        boundary_map_float = gaussian_filter(boundary_map_float, sigma=smooth_sigma, mode='constant', cval=0.0)
+        # Renormalize to [0, 1] range after smoothing
+        if boundary_map_float.max() > 0:
+            boundary_map_float = boundary_map_float / boundary_map_float.max()
+    
+    # Train everywhere (no masking for boundary classification)
+    training_mask = np.ones_like(instance_mask, dtype=bool)
+    
+    if debug:
+        n_boundary = boundary_map.sum()
+        n_total = instance_mask.size
+        n_cells = (instance_mask > 0).sum()
+        boundary_fraction = n_boundary / max(n_cells, 1) if n_cells > 0 else 0
+        print(f"[make_boundary_gt] Boundary pixels (before smoothing): {n_boundary}/{n_total} ({100*n_boundary/n_total:.2f}%)")
+        print(f"[make_boundary_gt] After smoothing: min={boundary_map_float.min():.3f}, max={boundary_map_float.max():.3f}, mean={boundary_map_float.mean():.3f}")
+        print(f"[make_boundary_gt] Boundary fraction within cells: {100*boundary_fraction:.1f}%")
+    
+    return boundary_map_float, training_mask
+
+
+def soft_dice_loss(pred_probs, target, smooth=1e-6):
+    """
+    Soft Dice loss for binary segmentation.
+    
+    Args:
+        pred_probs (torch.Tensor): Predicted probabilities in [0,1] (after sigmoid)
+        target (torch.Tensor): Ground truth binary mask in {0,1}
+        smooth (float): Smoothing constant to avoid division by zero
+    
+    Returns:
+        torch.Tensor: Dice coefficient in [0,1] (1 = perfect overlap)
+    """
+    intersection = (pred_probs * target).sum()
+    union = pred_probs.sum() + target.sum()
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return dice
+
+
+def _loss_fn_seg(lbl, y, device, boundary_gt=None, boundary_pred=None, boundary_mask=None, lambda_boundary=1.0):
     """
     Calculates the loss function between true labels lbl and prediction y.
-
+    
+    Now uses binary boundary classification with BCE + Dice loss.
+    
     Args:
         lbl (numpy.ndarray): True labels (cellprob, flowsY, flowsX).
         y (torch.Tensor): Predicted values (flowsY, flowsX, cellprob).
         device (torch.device): Device on which the tensors are located.
+        boundary_gt (numpy.ndarray or None): Binary boundary GT (N, H, W) in {0,1}
+        boundary_pred (torch.Tensor or None): Predicted boundary logits (N, 1, H, W)
+        boundary_mask (numpy.ndarray or None): Training mask (unused, kept for API compatibility)
+        lambda_boundary (float): Weight for boundary loss (default: 1.0)
 
     Returns:
-        torch.Tensor: Loss value.
-
+        tuple: (total_loss, flow_loss, cellprob_loss, boundary_loss)
     """
     criterion = nn.MSELoss(reduction="mean")
     criterion2 = nn.BCEWithLogitsLoss(reduction="mean")
+    
+    # Original flow + cellprob loss
     veci = 5. * torch.from_numpy(lbl[:, 1:]).to(device)
-    loss = criterion(y[:, :2], veci)
-    loss /= 2.
-    loss2 = criterion2(y[:, -1], torch.from_numpy(lbl[:, 0] > 0.5).to(device).float())
-    loss = loss + loss2
-    return loss
+    flow_loss = criterion(y[:, :2], veci)
+    flow_loss /= 2.
+    cellprob_loss = criterion2(y[:, -1], torch.from_numpy(lbl[:, 0] > 0.5).to(device).float())
+    loss = flow_loss + cellprob_loss
+    
+    # Boundary probability classification with BCE + Dice
+    boundary_loss = torch.tensor(0.0, device=device)
+    if boundary_gt is not None and boundary_pred is not None:
+        boundary_target = torch.from_numpy(boundary_gt).to(device).float()
+        
+        # Squeeze channel dimension if needed: (N, 1, H, W) -> (N, H, W)
+        if boundary_pred.dim() == 4:
+            boundary_logits = boundary_pred.squeeze(1)
+        else:
+            boundary_logits = boundary_pred
+        
+        # Flatten for loss computation
+        batch_size = boundary_target.shape[0]
+        boundary_logits_flat = boundary_logits.view(batch_size, -1)
+        boundary_target_flat = boundary_target.view(batch_size, -1)
+        
+        # Compute data-driven class weighting
+        n_positive = boundary_target_flat.sum().item()
+        n_total = boundary_target_flat.numel()
+        n_negative = n_total - n_positive
+        pos_weight_value = n_negative / max(n_positive, 1.0)
+        
+        # BCE loss with data-driven positive class weighting
+        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            boundary_logits_flat, 
+            boundary_target_flat,
+            pos_weight=torch.tensor([pos_weight_value], device=device)
+        )
+        
+        # Soft Dice loss (need probabilities, not logits)
+        boundary_probs = torch.sigmoid(boundary_logits_flat)
+        dice_coef = soft_dice_loss(boundary_probs, boundary_target_flat)
+        dice_loss = 1.0 - dice_coef
+        
+        # Gradient smoothness regularizer: penalize large spatial gradients
+        # Compute probability map in 2D: (N, H, W)
+        boundary_probs_2d = torch.sigmoid(boundary_logits)
+        
+        # Compute spatial gradients using finite differences
+        # ∂x: difference along width (dim=2)
+        grad_x = boundary_probs_2d[:, :, 1:] - boundary_probs_2d[:, :, :-1]
+        # ∂y: difference along height (dim=1)
+        grad_y = boundary_probs_2d[:, 1:, :] - boundary_probs_2d[:, :-1, :]
+        
+        # L2 gradient smoothness: mean((∂x)² + (∂y)²)
+        smooth_loss = (grad_x ** 2).mean() + (grad_y ** 2).mean()
+        
+        # Combined loss: BCE + 0.3 * Dice + 0.01 * Smoothness
+        boundary_loss = bce_loss + 0.3 * dice_loss + 0.01 * smooth_loss
+        
+        # Enhanced monitoring: check for collapse and saturation
+        pred_std = boundary_probs.std().item()
+        pred_mean = boundary_probs.mean().item()
+        target_mean = boundary_target_flat.mean().item()
+        pct_positive = (boundary_probs > 0.5).float().mean().item()
+        
+        # Logit statistics for saturation detection
+        logit_mean = boundary_logits_flat.mean().item()
+        logit_std = boundary_logits_flat.std().item()
+        logit_saturated = (boundary_logits_flat.abs() > 4.0).float().mean().item()
+        
+        # Warnings
+        if pred_std < 0.02:
+            print(f"WARNING: Boundary prediction collapsed! std={pred_std:.6f}, mean={pred_mean:.4f}")
+            print(f"  target mean={target_mean:.4f} ({100*target_mean:.2f}% boundary pixels)")
+            print(f"  BCE={bce_loss.item():.4f}, Dice={dice_loss.item():.4f}, pct>0.5={100*pct_positive:.2f}%")
+        
+        if logit_saturated > 0.5:
+            print(f"WARNING: Logits saturating! {100*logit_saturated:.1f}% pixels with |logit| > 4")
+            print(f"  logit mean={logit_mean:.3f}, std={logit_std:.3f}")
+        
+        loss = loss + lambda_boundary * boundary_loss
+    
+    # Return total loss and individual components
+    return loss, flow_loss, cellprob_loss, boundary_loss
 
 
 def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
                channels=None, channel_axis=None, rgb=False,
-               normalize_params={"normalize": False}):
+               normalize_params={"normalize": False}, return_masks=False):
     """
     Get a batch of images and labels.
 
@@ -52,20 +243,70 @@ def _get_batch(inds, data=None, labels=None, files=None, labels_files=None,
         channels (list or None): List of channel indices to extract from images.
         channel_axis (int or None): Axis along which the channels are located.
         normalize_params (dict): Dictionary of parameters for image normalization (will be faster, if loading from files to pre-normalize).
+        return_masks (bool): If True, return instance masks in addition to flow labels.
 
     Returns:
-        tuple: A tuple containing two lists: the batch of images and the batch of labels.
+        tuple: (imgs, lbls) or (imgs, lbls, masks) if return_masks=True
     """
     if data is None:
         lbls = None
+        masks = None
         imgs = [io.imread(files[i]) for i in inds]
         imgs = _reshape_norm(imgs, channels=channels, channel_axis=channel_axis,
                              rgb=rgb, normalize_params=normalize_params)
         if labels_files is not None:
-            lbls = [io.imread(labels_files[i])[1:] for i in inds]
+            full_labels = [io.imread(labels_files[i]) for i in inds]
+            lbls = [fl[1:] for fl in full_labels]  # flows only
+            if return_masks:
+                # Load actual instance masks from mask files, not from flow files
+                # Flow files may have empty/zero mask channel (index 0)
+                masks = []
+                for i in inds:
+                    # Get mask file path from image file path
+                    img_file = files[i]
+                    mask_file = img_file.replace('.tif', '_masks.tif').replace('.png', '_masks.png').replace('.jpg', '_masks.jpg')
+                    if not os.path.exists(mask_file):
+                        # Try alternate naming
+                        from pathlib import Path
+                        base_path = Path(img_file)
+                        mask_file = str(base_path.parent / f"{base_path.stem}_masks{base_path.suffix}")
+                    if os.path.exists(mask_file):
+                        loaded_mask = io.imread(mask_file)
+                        masks.append(loaded_mask)
+                        if i == inds[0]:  # Debug first mask
+                            print(f"[_get_batch] Loaded mask from {mask_file}: shape={loaded_mask.shape}, min={loaded_mask.min()}, max={loaded_mask.max()}, unique={len(np.unique(loaded_mask))}")
+                    else:
+                        # Fallback to flow file mask (may be zeros)
+                        fallback_mask = full_labels[inds.tolist().index(i)][0]
+                        masks.append(fallback_mask)
+                        if i == inds[0]:  # Debug first mask
+                            print(f"[_get_batch] Using fallback mask: shape={fallback_mask.shape}, min={fallback_mask.min()}, max={fallback_mask.max()}, unique={len(np.unique(fallback_mask))}")
     else:
         imgs = [data[i] for i in inds]
-        lbls = [labels[i][1:] for i in inds]
+        full_labels = [labels[i] for i in inds]
+        lbls = [fl[1:] for fl in full_labels]  # flows only
+        if return_masks:
+            # When loading from memory, we need to load mask files separately
+            masks = []
+            if files is not None:
+                for i in inds:
+                    img_file = files[i]
+                    mask_file = img_file.replace('.tif', '_masks.tif').replace('.png', '_masks.png').replace('.jpg', '_masks.jpg')
+                    if not os.path.exists(mask_file):
+                        from pathlib import Path
+                        base_path = Path(img_file)
+                        mask_file = str(base_path.parent / f"{base_path.stem}_masks{base_path.suffix}")
+                    if os.path.exists(mask_file):
+                        masks.append(io.imread(mask_file))
+                    else:
+                        # Fallback to flow data mask (may be zeros)
+                        masks.append(full_labels[inds.tolist().index(i)][0])
+            else:
+                # No file paths available, use flow data (may be zeros)
+                masks = [fl[0] for fl in full_labels]
+    
+    if return_masks:
+        return imgs, lbls, masks
     return imgs, lbls
 
 
@@ -334,7 +575,9 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
               channel_axis=None, rgb=False, normalize=True, compute_flows=False,
               save_path=None, save_every=100, save_each=False, nimg_per_epoch=None,
               nimg_test_per_epoch=None, rescale=True, scale_range=None, bsize=224,
-              min_train_masks=5, model_name=None):
+              min_train_masks=5, model_name=None,
+              lambda_boundary=1.0,
+              epoch_callback=None):
     """
     Train the network with images for segmentation.
 
@@ -434,17 +677,33 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
     train_logger.info(f">>> n_epochs={n_epochs}, n_train={nimg}, n_test={nimg_test}")
 
     if not SGD:
+        # Use parameter groups: lower LR for backbone, moderate for boundary head
+        backbone_lr = 1e-5
+        boundary_lr = 1e-4  # Reduced from 5e-4 to avoid saturation
+        
+        # Separate parameters for boundary head components vs rest of network
+        boundary_params = list(net.logdist_head.parameters()) + list(net.upsample_logdist.parameters())
+        boundary_param_ids = set(id(p) for p in boundary_params)
+        backbone_params = [p for p in net.parameters() if id(p) not in boundary_param_ids]
+        
+        param_groups = [
+            {'params': backbone_params, 'lr': backbone_lr},
+            {'params': boundary_params, 'lr': boundary_lr}
+        ]
+        
         train_logger.info(
-            f">>> AdamW, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}"
+            f">>> AdamW, backbone_lr={backbone_lr:0.6f}, boundary_lr={boundary_lr:0.5f}, weight_decay={weight_decay:0.5f}"
         )
-        optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate,
-                                      weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     else:
         train_logger.info(
             f">>> SGD, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}, momentum={momentum:0.3f}"
         )
         optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate,
                                     weight_decay=weight_decay, momentum=momentum)
+    
+    # Store base learning rates for each param group to apply schedule as multiplier
+    base_lrs = [pg['lr'] for pg in optimizer.param_groups]
 
     t0 = time.time()
     model_name = f"cellpose_{t0}" if model_name is None else model_name
@@ -456,6 +715,13 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
 
     lavg, nsum = 0, 0
     train_losses, test_losses = np.zeros(n_epochs), np.zeros(n_epochs)
+    # Track individual loss components
+    train_flow_losses = np.zeros(n_epochs)
+    train_cellprob_losses = np.zeros(n_epochs)
+    train_boundary_losses = np.zeros(n_epochs)
+    test_flow_losses = np.zeros(n_epochs)
+    test_cellprob_losses = np.zeros(n_epochs)
+    test_boundary_losses = np.zeros(n_epochs)
     for iepoch in range(n_epochs):
         np.random.seed(iepoch)
         if nimg != nimg_per_epoch:
@@ -465,38 +731,183 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         else:
             # otherwise use all images
             rperm = np.random.permutation(np.arange(0, nimg))
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = LR[iepoch] # set learning rate
+        # Apply LR schedule as multiplier on base learning rates
+        lr_multiplier = LR[iepoch] / learning_rate if learning_rate > 0 else 1.0
+        for i, param_group in enumerate(optimizer.param_groups):
+            param_group["lr"] = base_lrs[i] * lr_multiplier
         net.train()
         for k in range(0, nimg_per_epoch, batch_size):
             kend = min(k + batch_size, nimg_per_epoch)
             inds = rperm[k:kend]
-            imgs, lbls = _get_batch(inds, data=train_data, labels=train_labels,
-                                    files=train_files, labels_files=train_labels_files,
-                                    **kwargs)
+            
+            # Get batch with instance masks
+            imgs, lbls, masks = _get_batch(inds, data=train_data, labels=train_labels,
+                                          files=train_files, labels_files=train_labels_files,
+                                          return_masks=True, **kwargs)
+            
             diams = np.array([diam_train[i] for i in inds])
             rsc = diams / net.diam_mean.item() if rescale else np.ones(
                 len(diams), "float32")
-            # augmentations
-            imgi, lbl = transforms.random_rotate_and_resize(imgs, Y=lbls, rescale=rsc,
-                                                            scale_range=scale_range,
-                                                            xy=(bsize, bsize))[:2]
-            # network and loss optimization
+            
+            # Augmentations
+            imgi, lbl = transforms.random_rotate_and_resize(
+                imgs, Y=lbls, rescale=rsc, scale_range=scale_range, xy=(bsize, bsize)
+            )[:2]
+            
+            # Apply same augmentation to masks and generate log-distance GT
+            _, masks_aug = transforms.random_rotate_and_resize(
+                imgs, Y=masks, rescale=rsc,
+                scale_range=scale_range, xy=(bsize, bsize)
+            )[:2]
+            
+            # Debug: Check masks after augmentation
+            if iepoch == 0 and k == 0:
+                train_logger.info(f"[After augmentation] masks_aug type: {type(masks_aug)}, shape: {masks_aug.shape if isinstance(masks_aug, np.ndarray) else 'list'}")
+                if isinstance(masks_aug, np.ndarray):
+                    train_logger.info(f"  masks_aug[0] shape={masks_aug[0].shape}, min={masks_aug[0].min()}, max={masks_aug[0].max()}, unique={len(np.unique(masks_aug[0]))}")
+                else:
+                    train_logger.info(f"  masks_aug is not ndarray, it's {type(masks_aug)}")
+            
+            # Remove channel dimension if present: (N, 1, H, W) -> (N, H, W)
+            masks_aug_squeezed = [m[0] if m.ndim == 3 and m.shape[0] == 1 else m for m in masks_aug]
+            
+            # Debug: Check masks after squeezing
+            if iepoch == 0 and k == 0:
+                for idx, m in enumerate(masks_aug_squeezed):
+                    train_logger.info(f"[After squeezing] mask {idx}: shape={m.shape}, ndim={m.ndim}, min={m.min()}, max={m.max()}, unique={len(np.unique(m))}")
+            
+            # Track empty masks
+            empty_mask_count = sum(1 for m in masks_aug_squeezed if m.max() == 0)
+            if empty_mask_count > 0 and k == 0:
+                train_logger.info(f"[Empty Masks] Epoch {iepoch}, batch 0: {empty_mask_count}/{len(masks_aug_squeezed)} masks are empty ({100*empty_mask_count/len(masks_aug_squeezed):.1f}%)")
+            
+            # Generate boundary ring targets
+            boundary_results = [
+                make_boundary_gt(mask, mean_diameter=30.0, debug=(iepoch==0 and k==0 and idx==0))
+                for idx, mask in enumerate(masks_aug_squeezed)
+            ]
+            boundary_gt_batch = np.array([result[0] for result in boundary_results])
+            boundary_mask_batch = np.array([result[1] for result in boundary_results])
+            
+            # Debug: Print boundary GT statistics for first batch of first epoch
+            if iepoch == 0 and k == 0:
+                train_logger.info(f"Boundary GT batch stats: shape={boundary_gt_batch.shape}, dtype={boundary_gt_batch.dtype}")
+                train_logger.info(f"  min={boundary_gt_batch.min():.4f}, max={boundary_gt_batch.max():.4f}, mean={boundary_gt_batch.mean():.4f}")
+                train_logger.info(f"  Boundary pixels: {(boundary_gt_batch > 0).sum()} / {boundary_gt_batch.size} ({100*(boundary_gt_batch > 0).sum()/boundary_gt_batch.size:.1f}%)")
+                for idx, mask in enumerate(masks_aug_squeezed):
+                    train_logger.info(f"  Mask {idx}: shape={mask.shape}, min={mask.min()}, max={mask.max()}, unique_labels={len(np.unique(mask))}")
+            
+            # Network forward pass
             X = torch.from_numpy(imgi).to(device)
-            y = net(X)[0]
-            loss = _loss_fn_seg(lbl, y, device)
+            net_output = net(X)
+            
+            # Debug: print output structure
+            if iepoch == 0 and i == 0:
+                train_logger.info(f"Network output length: {len(net_output)}")
+                train_logger.info(f"Network has logdist_head: {hasattr(net, 'logdist_head')}")
+                for idx, out in enumerate(net_output):
+                    if isinstance(out, torch.Tensor):
+                        train_logger.info(f"  output[{idx}]: Tensor shape {out.shape}")
+                    elif isinstance(out, list):
+                        train_logger.info(f"  output[{idx}]: List of {len(out)} tensors")
+                        for jdx, t in enumerate(out):
+                            if isinstance(t, torch.Tensor):
+                                train_logger.info(f"    [{jdx}]: Tensor shape {t.shape}")
+                    else:
+                        train_logger.info(f"  output[{idx}]: {type(out)}")
+            
+            y = net_output[0]  # flows + cellprob
+            # Network returns: (T1, style, T0, boundary_pred)
+            boundary_pred = net_output[-1]  # boundary predictions
+            
+            # Debug: Check raw network output (detailed per-image statistics)
+            if k == 0:  # Every epoch, first batch
+                train_logger.info(f"\n=== BOUNDARY OUTPUT ANALYSIS (Epoch {iepoch}) ===")
+                train_logger.info(f"[Batch-wide] shape: {boundary_pred.shape}, dtype: {boundary_pred.dtype}")
+                train_logger.info(f"[Batch-wide] min={boundary_pred.min().item():.6f}, max={boundary_pred.max().item():.6f}, mean={boundary_pred.mean().item():.6f}, std={boundary_pred.std().item():.6f}")
+                train_logger.info(f"[Batch-wide] unique_values={len(torch.unique(boundary_pred))}")
+                
+                # Per-image statistics
+                for img_idx in range(min(3, boundary_pred.shape[0])):  # First 3 images
+                    img_pred = boundary_pred[img_idx]
+                    train_logger.info(f"[Image {img_idx}] min={img_pred.min().item():.6f}, max={img_pred.max().item():.6f}, "
+                                    f"mean={img_pred.mean().item():.6f}, std={img_pred.std().item():.6f}, unique={len(torch.unique(img_pred))}")
+                train_logger.info("==========================================\n")
+            
+            # Compute loss with boundary classification
+            loss, flow_loss, cellprob_loss, boundary_loss = _loss_fn_seg(lbl, y, device, 
+                              boundary_gt=boundary_gt_batch,
+                              boundary_pred=boundary_pred,
+                              boundary_mask=boundary_mask_batch,
+                              lambda_boundary=lambda_boundary)
+            
+            # Debug: Print loss components and boundary statistics for first batch of each epoch
+            if k == 0:
+                # Compute boundary prediction statistics
+                boundary_sigmoid = torch.sigmoid(boundary_pred)
+                pred_mean = boundary_sigmoid.mean().item()
+                pred_std = boundary_sigmoid.std().item()
+                pred_above_threshold = (boundary_sigmoid > 0.5).float().mean().item() * 100
+                
+                # Check for collapse
+                if pred_std < 0.02:
+                    train_logger.warning(f"[COLLAPSE WARNING] Boundary predictions collapsed! std={pred_std:.4f}, mean={pred_mean:.4f}")
+                
+                train_logger.info(f"[Epoch {iepoch}, batch 0] flow={flow_loss.item():.4f}, cellprob={cellprob_loss.item():.4f}, boundary={boundary_loss.item():.4f}, total={loss.item():.4f}")
+                train_logger.info(f"[Boundary stats] mean={pred_mean:.4f}, std={pred_std:.4f}, %>0.5={pred_above_threshold:.1f}%")
+            
             optimizer.zero_grad()
             loss.backward()
+            
+            # Debug: Monitor gradients and learning rates
+            if k == 0 and hasattr(net, 'logdist_head') and net.logdist_head is not None:
+                train_logger.info(f"\n=== GRADIENT & LR ANALYSIS (Epoch {iepoch}) ===")
+                
+                # Check optimizer learning rates
+                for group_idx, param_group in enumerate(optimizer.param_groups):
+                    train_logger.info(f"[Optimizer] param_group[{group_idx}] lr={param_group['lr']:.6f}")
+                
+                # Logdist head gradient norms
+                grad_norms = []
+                for name, param in net.logdist_head.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        grad_norms.append(grad_norm)
+                        train_logger.info(f"  logdist_head.{name}: grad_norm={grad_norm:.6f}")
+                    else:
+                        train_logger.warning(f"  logdist_head.{name}: grad is None!")
+                
+                if len(grad_norms) > 0:
+                    avg_grad = sum(grad_norms)/len(grad_norms)
+                    train_logger.info(f"[Gradient Summary] average={avg_grad:.6f}, min={min(grad_norms):.6f}, max={max(grad_norms):.6f}")
+                    if avg_grad < 1e-6:
+                        train_logger.warning(f"  WARNING: Gradients are tiny (avg={avg_grad:.6f})!")
+                else:
+                    train_logger.warning("  WARNING: logdist_head has NO gradients!")
+                
+                train_logger.info("==========================================\n")
+            
             optimizer.step()
             train_loss = loss.item()
-            train_loss *= len(imgi)
+            batch_size_actual = len(imgi)
+            train_loss *= batch_size_actual
 
             # keep track of average training loss across epochs
             lavg += train_loss
-            nsum += len(imgi)
-            # per epoch training loss
+            nsum += batch_size_actual
+            # per epoch training loss (total and components)
             train_losses[iepoch] += train_loss
+            train_flow_losses[iepoch] += flow_loss.item() * batch_size_actual
+            train_cellprob_losses[iepoch] += cellprob_loss.item() * batch_size_actual
+            train_boundary_losses[iepoch] += boundary_loss.item() * batch_size_actual
+        # Normalize all losses by number of samples
         train_losses[iepoch] /= nimg_per_epoch
+        train_flow_losses[iepoch] /= nimg_per_epoch
+        train_cellprob_losses[iepoch] /= nimg_per_epoch
+        train_boundary_losses[iepoch] /= nimg_per_epoch
+        
+        # Debug: Log component losses after normalization
+        train_logger.info(f"[Epoch {iepoch} components] flow={train_flow_losses[iepoch]:.4f}, cellprob={train_cellprob_losses[iepoch]:.4f}, boundary={train_boundary_losses[iepoch]:.4f}")
 
         if iepoch == 5 or iepoch % 10 == 0:
             lavgt = 0.
@@ -511,29 +922,90 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
                     with torch.no_grad():
                         net.eval()
                         inds = rperm[ibatch:ibatch + batch_size]
-                        imgs, lbls = _get_batch(inds, data=test_data,
-                                                labels=test_labels, files=test_files,
-                                                labels_files=test_labels_files,
-                                                **kwargs)
+                        
+                        # Get batch with masks for boundary GT
+                        imgs, lbls, masks = _get_batch(
+                            inds, data=test_data, labels=test_labels, 
+                            files=test_files, labels_files=test_labels_files,
+                            return_masks=True, **kwargs
+                        )
+                        
                         diams = np.array([diam_test[i] for i in inds])
                         rsc = diams / net.diam_mean.item() if rescale else np.ones(
                             len(diams), "float32")
-                        imgi, lbl = transforms.random_rotate_and_resize(
+                        
+                        # Augment images, flows, and masks
+                        aug_output = transforms.random_rotate_and_resize(
                             imgs, Y=lbls, rescale=rsc, scale_range=scale_range,
-                            xy=(bsize, bsize))[:2]
+                            xy=(bsize, bsize)
+                        )
+                        imgi, lbl = aug_output[:2]
+                        
+                        # Apply same augmentation to masks
+                        _, masks_aug = transforms.random_rotate_and_resize(
+                            imgs, Y=masks, rescale=rsc,
+                            scale_range=scale_range, xy=(bsize, bsize)
+                        )[:2]
+                        # Remove channel dimension if present: (N, 1, H, W) -> (N, H, W)
+                        masks_aug_squeezed = [m[0] if m.ndim == 3 and m.shape[0] == 1 else m for m in masks_aug]
+                        
+                        # Generate boundary ring targets
+                        boundary_results = [
+                            make_boundary_gt(mask, mean_diameter=30.0)
+                            for mask in masks_aug_squeezed
+                        ]
+                        logdist_gt_batch = np.array([result[0] for result in boundary_results])
+                        logdist_mask_batch = np.array([result[1] for result in boundary_results])
+                        
+                        # Forward pass
                         X = torch.from_numpy(imgi).to(device)
-                        y = net(X)[0]
-                        loss = _loss_fn_seg(lbl, y, device)
+                        net_output = net(X)
+                        y = net_output[0]
+                        # Network returns: (T1, style, T0, logdist_pred)
+                        logdist_pred = net_output[-1]  # Log-distance is last element
+                        
+                        # Compute loss with log-distance
+                        loss, flow_loss, cellprob_loss, logdist_loss = _loss_fn_seg(lbl, y, device,
+                                          boundary_gt=logdist_gt_batch,
+                                          boundary_pred=logdist_pred,
+                                          boundary_mask=logdist_mask_batch,
+                                          lambda_boundary=lambda_boundary)
                         test_loss = loss.item()
-                        test_loss *= len(imgi)
+                        batch_size_actual = len(imgi)
+                        test_loss *= batch_size_actual
                         lavgt += test_loss
+                        # Accumulate component losses
+                        test_flow_losses[iepoch] += flow_loss.item() * batch_size_actual
+                        test_cellprob_losses[iepoch] += cellprob_loss.item() * batch_size_actual
+                        test_boundary_losses[iepoch] += boundary_loss.item() * batch_size_actual
                 lavgt /= len(rperm)
                 test_losses[iepoch] = lavgt
+                # Normalize component losses
+                test_flow_losses[iepoch] /= len(rperm)
+                test_cellprob_losses[iepoch] /= len(rperm)
+                test_boundary_losses[iepoch] /= len(rperm)
             lavg /= nsum
             train_logger.info(
                 f"{iepoch}, train_loss={lavg:.4f}, test_loss={lavgt:.4f}, LR={LR[iepoch]:.6f}, time {time.time()-t0:.2f}s"
             )
             lavg, nsum = 0, 0
+        
+        # Call epoch callback if provided
+        if epoch_callback is not None:
+            try:
+                loss_dict = {
+                    'total': train_losses[iepoch],
+                    'flow': train_flow_losses[iepoch],
+                    'cellprob': train_cellprob_losses[iepoch],
+                    'boundary': train_boundary_losses[iepoch],
+                    'test_total': lavgt,
+                    'test_flow': test_flow_losses[iepoch],
+                    'test_cellprob': test_cellprob_losses[iepoch],
+                    'test_boundary': test_boundary_losses[iepoch]
+                }
+                epoch_callback(iepoch, train_losses[iepoch], lavgt, filename, loss_dict)
+            except Exception as e:
+                train_logger.warning(f"Epoch callback failed: {e}")
 
         if iepoch == n_epochs - 1 or (iepoch % save_every == 0 and iepoch != 0):
             if save_each and iepoch != n_epochs - 1:  #separate files as model progresses

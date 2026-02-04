@@ -381,7 +381,7 @@ class CellposeModel():
              flow3D_smooth=0, stitch_threshold=0.0, 
              min_size=15, max_size_fraction=0.4, niter=None, 
              augment=False, tile_overlap=0.1, bsize=224, 
-             interp=True, compute_masks=True, progress=None):
+             interp=True, compute_masks=True, progress=None, return_boundary=True):
         """ segment list of images x, or 4D array - Z x nchan x Y x X
 
         Args:
@@ -467,7 +467,7 @@ class CellposeModel():
                     cellprob_threshold=cellprob_threshold, compute_masks=compute_masks,
                     min_size=min_size, max_size_fraction=max_size_fraction, 
                     stitch_threshold=stitch_threshold, flow3D_smooth=flow3D_smooth,
-                    progress=progress, niter=niter)
+                    progress=progress, niter=niter, return_boundary=return_boundary)
                 masks.append(maski)
                 flows.append(flowi)
                 styles.append(stylei)
@@ -515,10 +515,10 @@ class CellposeModel():
             if do_normalization:
                 x = transforms.normalize_img(x, **normalize_params)
 
-            dP, cellprob, styles = self._run_net(
+            dP, cellprob, styles, boundary_prob = self._run_net(
                 x, rescale=rescale, augment=augment, 
                 batch_size=batch_size, tile_overlap=tile_overlap, bsize=bsize,
-                resample=resample, do_3D=do_3D, anisotropy=anisotropy)
+                resample=resample, do_3D=do_3D, anisotropy=anisotropy, return_boundary=return_boundary)
 
             if do_3D:    
                 if flow3D_smooth > 0:
@@ -538,13 +538,20 @@ class CellposeModel():
                 masks = np.zeros(0) #pass back zeros if not compute_masks
             
             masks, dP, cellprob = masks.squeeze(), dP.squeeze(), cellprob.squeeze()
+            if boundary_prob is not None:
+                boundary_prob = boundary_prob.squeeze()
 
-            return masks, [plot.dx_to_circ(dP), dP, cellprob], styles
+            # Return with boundary_prob added to flows list
+            flows_output = [plot.dx_to_circ(dP), dP, cellprob]
+            if return_boundary and boundary_prob is not None:
+                flows_output.append(boundary_prob)
+            
+            return masks, flows_output, styles
 
     def _run_net(self, x, rescale=1.0, resample=True, augment=False, 
                 batch_size=8, tile_overlap=0.1,
-                bsize=224, anisotropy=1.0, do_3D=False):
-        """ run network on image x """
+                bsize=224, anisotropy=1.0, do_3D=False, return_boundary=True):
+        """ run network on image x and optionally extract boundary probabilities """
         tic = time.time()
         shape = x.shape
         nimg = shape[0]
@@ -573,16 +580,33 @@ class CellposeModel():
                                             Ly=Lz, Lx=Lx).transpose(1,0,2,3)
             cellprob = yf[..., -1]
             dP = yf[..., :-1].transpose((3, 0, 1, 2))
+            # 3D boundary extraction not implemented yet
+            boundary_prob = None
         else:
-            yf, styles = run_net(self.net, x, bsize=bsize, augment=augment,
+            yf, styles, boundary_logits = run_net(self.net, x, bsize=bsize, augment=augment,
                                 batch_size=batch_size,  
                                 tile_overlap=tile_overlap, 
                                 rsz=rescale if rescale!=1.0 else None)
             if resample:
                 if rescale != 1.0:
                     yf = transforms.resize_image(yf, shape[1], shape[2])
+                    if boundary_logits is not None:
+                        # Resize boundary logits to original shape
+                        boundary_logits = transforms.resize_image(boundary_logits[:, np.newaxis, :, :], 
+                                                                 shape[1], shape[2])[:, 0, :, :]
             cellprob = yf[..., 2]
             dP = yf[..., :2].transpose((3, 0, 1, 2))
+            
+            # Convert log-distance to boundary probability
+            boundary_prob = None
+            if return_boundary and boundary_logits is not None:
+                # GT is now INVERTED: high values (0.8-1.0) = boundaries, low values (0.0-0.2) = interiors
+                # boundary_logits is already boundary probability (after sigmoid), use directly
+                # Handle shape: boundary_logits may be (1, H, W) or (H, W)
+                if boundary_logits.ndim == 3 and boundary_logits.shape[0] == 1:
+                    boundary_prob = boundary_logits[0]
+                else:
+                    boundary_prob = boundary_logits
         
         styles = styles.squeeze()
 
@@ -590,7 +614,7 @@ class CellposeModel():
         if nimg > 1:
             models_logger.info("network run in %2.2fs" % (net_time))
 
-        return dP, cellprob, styles
+        return dP, cellprob, styles, boundary_prob
     
     def _compute_masks(self, shape, dP, cellprob, flow_threshold=0.4, cellprob_threshold=0.0,
                        interp=True, min_size=15, max_size_fraction=0.4, niter=None,

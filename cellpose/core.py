@@ -180,18 +180,42 @@ def _forward(net, x):
         x (numpy.ndarray): The input images.
 
     Returns:
-        Tuple[numpy.ndarray, numpy.ndarray]: The output predictions (flows and cellprob) and style features.
+        Tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray or None]: The output predictions (flows and cellprob), style features, and boundary logits (if present).
     """
     X = _to_device(x, net.device)
     net.eval()
     if net.mkldnn:
         net = mkldnn_utils.to_mkldnn(net)
     with torch.no_grad():
-        y, style = net(X)[:2]
+        net_output = net(X)
+        y = net_output[0]
+        # Standard Cellpose order: T1, style, T0, [logdist_pred]
+        # output[0] = T1 (flows + cellprob)
+        # output[1] = style
+        # output[2] = T0 (list of downsampled tensors)
+        # output[3] = logdist_pred (if logdist head exists)
+        style = net_output[1]
+        if len(net_output) == 4 and hasattr(net, 'logdist_head'):
+            # Has logdist head: 4th element (index 3) is logdist_pred
+            boundary_logits = net_output[3]
+        else:
+            # No logdist head
+            boundary_logits = None
     del X
     y = _from_device(y)
     style = _from_device(style)
-    return y, style
+    boundary_logits = _from_device(boundary_logits) if boundary_logits is not None else None
+    
+    # Debug first call
+    if not hasattr(_forward, '_debug_printed'):
+        _forward._debug_printed = True
+        core_logger.info(f"[_forward] net has logdist_head: {hasattr(net, 'logdist_head')}")
+        core_logger.info(f"[_forward] net_output length: {len(net_output)}")
+        core_logger.info(f"[_forward] boundary_logits is None: {boundary_logits is None}")
+        if boundary_logits is not None:
+            core_logger.info(f"[_forward] boundary_logits shape: {boundary_logits.shape}, mean: {boundary_logits.mean():.4f}")
+    
+    return y, style, boundary_logits
 
 
 def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
@@ -237,6 +261,7 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         ly, lx = min(bsize, Ly), min(bsize, Lx)
     yf = np.zeros((Lz, nout, Ly, Lx), "float32")
     styles = np.zeros((Lz, 256), "float32")
+    boundary_logits_f = None  # Will be initialized if boundary head present
     
     # run multiple slices at the same time
     ntiles = ny * nx
@@ -259,9 +284,21 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
         
         ya = np.zeros((IMGa.shape[0], nout, ly, lx), "float32")
         stylea = np.zeros((IMGa.shape[0], 256), "float32")
+        boundary_tiles = None
         for j in range(0, IMGa.shape[0], batch_size):
             bslc = slice(j, min(j + batch_size, IMGa.shape[0]))
-            ya[bslc], stylea[bslc] = _forward(net, IMGa[bslc])
+            y_batch, style_batch, boundary_batch = _forward(net, IMGa[bslc])
+            ya[bslc] = y_batch
+            stylea[bslc] = style_batch
+            # Initialize boundary array on first batch if present
+            if boundary_batch is not None:
+                if boundary_tiles is None:
+                    # Boundary has shape (batch, 1, H, W) - squeeze channel dim
+                    boundary_tiles = np.zeros((IMGa.shape[0], ly, lx), "float32")
+                    if boundary_logits_f is None:
+                        boundary_logits_f = np.zeros((Lz, Ly, Lx), "float32")
+                boundary_tiles[bslc] = boundary_batch[:, 0]  # Remove channel dimension
+                
         for i, b in enumerate(inds):
             y = ya[i * ntiles : (i + 1) * ntiles]
             if augment:
@@ -270,13 +307,30 @@ def run_net(net, imgi, batch_size=8, augment=False, tile_overlap=0.1, bsize=224,
                 y = np.reshape(y, (-1, 3, ly, lx))
             yfi = transforms.average_tiles(y, ysub, xsub, Ly, Lx)
             yf[b] = yfi[:, :imgb.shape[-2], :imgb.shape[-1]]
+            
+            # Process boundary tiles with same stitching as cellprob
+            if boundary_tiles is not None:
+                boundary_tile_batch = boundary_tiles[i * ntiles : (i + 1) * ntiles]
+                if augment:
+                    boundary_tile_batch = np.reshape(boundary_tile_batch, (ny, nx, ly, lx))
+                    # Unaugment boundary tiles (add singleton channel dim for compatibility)
+                    boundary_aug = boundary_tile_batch[:, :, np.newaxis, :, :]
+                    boundary_aug = transforms.unaugment_tiles(boundary_aug)
+                    boundary_tile_batch = boundary_aug[:, :, 0, :, :]
+                    boundary_tile_batch = np.reshape(boundary_tile_batch, (-1, ly, lx))
+                # Average tiles (add channel dim temporarily)
+                boundary_avg = transforms.average_tiles(boundary_tile_batch[:, np.newaxis, :, :], ysub, xsub, Ly, Lx)
+                boundary_logits_f[b] = boundary_avg[0, :imgb.shape[-2], :imgb.shape[-1]]
+            
             stylei = stylea[i * ntiles:(i + 1) * ntiles].sum(axis=0)
             stylei /= (stylei**2).sum()**0.5
             styles[b] = stylei
     # slices from padding
     yf = yf[:, :, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
+    if boundary_logits_f is not None:
+        boundary_logits_f = boundary_logits_f[:, ypad1 : Ly-ypad2, xpad1 : Lx-xpad2]
     yf = yf.transpose(0,2,3,1)   
-    return yf, np.array(styles)
+    return yf, np.array(styles), boundary_logits_f
 
 
 def run_3D(net, imgs, batch_size=8, augment=False,

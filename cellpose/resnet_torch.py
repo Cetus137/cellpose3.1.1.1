@@ -138,6 +138,63 @@ class make_style(nn.Module):
         return style
 
 
+class LogDistHead(nn.Module):
+    """
+    Distance regression head for boundary detection.
+    
+    Predicts normalized linear distance in [0,1] from decoder features.
+    Uses unsigned distance transform (min of interior and exterior distances).
+    
+    Args:
+        in_channels (int): Number of input channels from decoder
+        conv_3D (bool): Whether to use 3D convolutions
+    """
+    
+    def __init__(self, decoder_channels, encoder_channels, conv_3D=False):
+        super().__init__()
+        conv_layer = nn.Conv3d if conv_3D else nn.Conv2d
+        norm_layer = nn.BatchNorm3d if conv_3D else nn.BatchNorm2d
+        
+        # Combine decoder features (semantic) with encoder features (spatial detail)
+        # Skip connection from encoder preserves sharp boundary information
+        combined_channels = decoder_channels + encoder_channels
+        hidden = max(combined_channels // 2, 64)
+        
+        self.head = nn.Sequential(
+            conv_layer(combined_channels, hidden, kernel_size=3, padding=1),
+            norm_layer(hidden),
+            nn.ReLU(inplace=True),
+            conv_layer(hidden, hidden // 2, kernel_size=3, padding=1),
+            norm_layer(hidden // 2),
+            nn.ReLU(inplace=True),
+            conv_layer(hidden // 2, 1, kernel_size=1),  # Output raw logits (no activation)
+            # NO Sigmoid here! BCE_with_logits expects raw logits
+        )
+    
+    def forward(self, decoder_features, encoder_features):
+        """Returns (N, 1, H, W) raw distance predictions (unbounded linear output)."""
+        # Debug: Check feature magnitudes to see if skip is being used
+        if self.training and torch.rand(1).item() < 0.01:  # 1% of batches
+            dec_mean = decoder_features.abs().mean().item()
+            enc_mean = encoder_features.abs().mean().item()
+            print(f"[SkipConnection DEBUG] decoder_features: mean_abs={dec_mean:.4f}, "
+                  f"encoder_features: mean_abs={enc_mean:.4f}, ratio={dec_mean/enc_mean:.2f}")
+        
+        # Concatenate decoder (semantic) with encoder (spatial detail)
+        combined = torch.cat([decoder_features, encoder_features], dim=1)
+        
+        # Return raw linear output (no sigmoid) for regression training
+        output = self.head(combined)
+        
+        # Debug: Check output values
+        if self.training and torch.rand(1).item() < 0.01:  # 1% of batches
+            print(f"[LogDistHead DEBUG] raw_output: mean={output.mean().item():.4f}, "
+                  f"std={output.std().item():.4f}, "
+                  f"min={output.min().item():.4f}, max={output.max().item():.4f}")
+        
+        return output
+
+
 class upsample(nn.Module):
 
     def __init__(self, nbase, sz, conv_3D=False):
@@ -208,6 +265,12 @@ class CPnet(nn.Module):
         self.upsample = upsample(nbaseup, sz, conv_3D=conv_3D)
         self.make_style = make_style(conv_3D=conv_3D)
         self.output = batchconv(nbaseup[0], nout, 1, conv_3D=conv_3D)
+        
+        # Separate decoder branch for log-distance head (independent from flow)
+        self.upsample_logdist = upsample(nbaseup, sz, conv_3D=conv_3D)
+        # Pass encoder OUTPUT channels for skip connection (T0[0] has nbase[1] channels)
+        self.logdist_head = LogDistHead(nbaseup[0], nbase[1], conv_3D=conv_3D)
+        
         self.diam_mean = nn.Parameter(data=torch.ones(1) * diam_mean,
                                       requires_grad=False)
         self.diam_labels = nn.Parameter(data=torch.ones(1) * diam_mean,
@@ -231,7 +294,11 @@ class CPnet(nn.Module):
             data (torch.Tensor): Input data.
 
         Returns:
-            tuple: A tuple containing the output tensor, style tensor, and downsampled tensors.
+            tuple: A tuple containing:
+                - T1: output tensor (flows + cellprob)
+                - style0: style tensor
+                - T0: downsampled tensors
+                - boundary_logits: boundary probability logits (N, 1, H, W) - appended as extra output
         """
         if self.mkldnn:
             data = data.to_mkldnn()
@@ -243,12 +310,44 @@ class CPnet(nn.Module):
         style0 = style
         if not self.style_on:
             style = style * 0
-        T1 = self.upsample(style, T0, self.mkldnn)
-        T1 = self.output(T1)
+        
+        # Decoder features for flow/cellprob head
+        T1_features = self.upsample(style, T0, self.mkldnn)
+        
+        # Original output head (flows + cellprob)
+        T1 = self.output(T1_features)
+        
+        # Separate decoder for log-distance head (independent features)
+        T1_logdist = self.upsample_logdist(style, T0, self.mkldnn)
+        
+        # Get encoder features for skip connection (first layer has highest spatial resolution)
+        encoder_features = T0[0]
+        
+        # Handle mkldnn tensors
+        if self.mkldnn:
+            decoder_features = T1_logdist.to_dense()
+            encoder_features = encoder_features.to_dense()
+        else:
+            decoder_features = T1_logdist
+        
+        # Pass both decoder and encoder features to logdist head (skip connection)
+        logdist_pred = self.logdist_head(decoder_features, encoder_features)
+        
+        # Pass both decoder and encoder features to logdist head
+        if self.mkldnn:
+            decoder_features = T1_logdist.to_dense()
+        else:
+            decoder_features = T1_logdist
+        
+        logdist_pred = self.logdist_head(decoder_features, encoder_features)
+        
         if self.mkldnn:
             T0 = [t0.to_dense() for t0 in T0]
             T1 = T1.to_dense()
-        return T1, style0, T0
+        
+        # Return: (T1, style, T0, logdist_pred)
+        # logdist_pred: (N, 1, H, W) normalized log-distance in [0,1]
+        return T1, style0, T0, logdist_pred
 
     def save_model(self, filename):
         """
