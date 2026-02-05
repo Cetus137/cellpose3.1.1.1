@@ -17,6 +17,9 @@ from pathlib import Path
 import argparse
 from datetime import datetime
 import json
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
 
 from boundary_unet import BoundaryUNet, count_parameters
 from dataset import get_dataloaders
@@ -27,13 +30,14 @@ class BoundaryTrainer:
     
     def __init__(self, model, train_loader, val_loader=None, 
                  lr=1e-3, weight_decay=1e-4, device='cuda', 
-                 save_dir='./checkpoints'):
+                 save_dir='./checkpoints', save_every=10):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.save_every = save_every
         
         # Optimizer
         self.optimizer = AdamW(
@@ -52,7 +56,9 @@ class BoundaryTrainer:
         # Training history
         self.history = {
             'train_loss': [],
+            'train_bce': [],
             'val_loss': [],
+            'val_bce': [],
             'best_val_loss': float('inf'),
             'best_epoch': 0
         }
@@ -108,6 +114,7 @@ class BoundaryTrainer:
         
         metrics = {
             'loss': bce_loss.item(),
+            'bce': bce_loss.item(),
             'pos_weight': pos_weight,
             'accuracy': accuracy,
             'boundary_recall': boundary_recall,
@@ -115,7 +122,11 @@ class BoundaryTrainer:
             'gt_mean': target.mean().item()
         }
         
-        return bce_loss, metrics
+        loss_components = {
+            'bce': bce_loss.item()
+        }
+        
+        return bce_loss, metrics, loss_components
     
     def train_epoch(self, epoch):
         """Train for one epoch."""
@@ -132,7 +143,7 @@ class BoundaryTrainer:
             logits = self.model(images)
             
             # Compute loss
-            loss, metrics = self.compute_loss(logits, boundary_gt)
+            loss, metrics, loss_components = self.compute_loss(logits, boundary_gt)
             
             # Backward pass
             self.optimizer.zero_grad()
@@ -182,7 +193,7 @@ class BoundaryTrainer:
                 logits = self.model(images)
                 
                 # Compute loss
-                loss, metrics = self.compute_loss(logits, boundary_gt)
+                loss, metrics, loss_components = self.compute_loss(logits, boundary_gt)
                 
                 val_losses.append(loss.item())
                 val_metrics.append(metrics)
@@ -198,6 +209,107 @@ class BoundaryTrainer:
         
         return avg_loss, avg_metrics
     
+    def plot_loss_curves(self, epoch):
+        """Plot loss curves and save to file (overwrites each epoch)."""
+        if len(self.history['train_loss']) == 0:
+            return
+        
+        epochs = range(1, len(self.history['train_loss']) + 1)
+        
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Total loss
+        axes[0].plot(epochs, self.history['train_loss'], 'b-', linewidth=2, label='Train Loss')
+        if len(self.history['val_loss']) > 0:
+            axes[0].plot(epochs, self.history['val_loss'], 'r-', linewidth=2, label='Val Loss')
+        axes[0].set_xlabel('Epoch', fontsize=12)
+        axes[0].set_ylabel('Loss', fontsize=12)
+        axes[0].set_title('Total Loss', fontsize=14, fontweight='bold')
+        axes[0].legend(fontsize=11)
+        axes[0].grid(True, alpha=0.3)
+        if len(epochs) > 1:
+            axes[0].set_xlim(1, max(epochs))
+        
+        # Loss components
+        axes[1].plot(epochs, self.history['train_bce'], 'g-', linewidth=2, label='BCE Loss (Train)')
+        if len(self.history['val_bce']) > 0:
+            axes[1].plot(epochs, self.history['val_bce'], 'm--', linewidth=2, label='BCE Loss (Val)')
+        axes[1].set_xlabel('Epoch', fontsize=12)
+        axes[1].set_ylabel('Loss Components', fontsize=12)
+        axes[1].set_title('Loss Components', fontsize=14, fontweight='bold')
+        axes[1].legend(fontsize=11)
+        axes[1].grid(True, alpha=0.3)
+        if len(epochs) > 1:
+            axes[1].set_xlim(1, max(epochs))
+        
+        plt.tight_layout()
+        plt.savefig(self.save_dir / 'loss_curve.png', dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    def visualize_predictions(self, epoch):
+        """Save visualization of predictions on example images."""
+        self.model.eval()
+        
+        # Use validation set if available, otherwise training set
+        loader = self.val_loader if self.val_loader is not None else self.train_loader
+        dataset_name = "Validation" if self.val_loader is not None else "Training"
+        
+        # Get random batch
+        import random
+        batch_idx = random.randint(0, len(loader) - 1)
+        for i, batch in enumerate(loader):
+            if i == batch_idx:
+                break
+        
+        images = batch['image'].to(self.device)
+        boundary_gt = batch['boundary_gt'].to(self.device)
+        filenames = batch['filename']
+        
+        with torch.no_grad():
+            logits = self.model(images)
+            boundary_pred = torch.sigmoid(logits)
+        
+        # Convert to numpy and take first 3 images in batch
+        n_show = min(3, images.shape[0])
+        
+        fig, axes = plt.subplots(n_show, 4, figsize=(16, 4*n_show))
+        if n_show == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i in range(n_show):
+            img = images[i, 0].cpu().numpy()
+            gt = boundary_gt[i, 0].cpu().numpy()
+            pred = boundary_pred[i, 0].cpu().numpy()
+            pred_binary = (pred > 0.5).astype(np.float32)
+            
+            # Raw image
+            axes[i, 0].imshow(img, cmap='gray')
+            axes[i, 0].set_title(f'Input: {filenames[i][:30]}', fontsize=10)
+            axes[i, 0].axis('off')
+            
+            # Ground truth boundaries
+            axes[i, 1].imshow(gt, cmap='hot', vmin=0, vmax=1)
+            axes[i, 1].set_title(f'GT Boundaries ({gt.sum():.0f} px)', fontsize=10)
+            axes[i, 1].axis('off')
+            
+            # Predicted boundary probability
+            im = axes[i, 2].imshow(pred, cmap='hot', vmin=0, vmax=1)
+            axes[i, 2].set_title(f'Pred Prob (μ={pred.mean():.3f})', fontsize=10)
+            axes[i, 2].axis('off')
+            plt.colorbar(im, ax=axes[i, 2], fraction=0.046, pad=0.04)
+            
+            # Binary prediction
+            axes[i, 3].imshow(pred_binary, cmap='hot', vmin=0, vmax=1)
+            axes[i, 3].set_title(f'Pred Binary ({pred_binary.sum():.0f} px)', fontsize=10)
+            axes[i, 3].axis('off')
+        
+        plt.suptitle(f'Boundary Predictions ({dataset_name}) - Epoch {epoch}', fontsize=16, fontweight='bold', y=1.00)
+        plt.tight_layout()
+        plt.savefig(self.save_dir / f'predictions_epoch_{epoch:04d}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        self.model.train()
+    
     def save_checkpoint(self, epoch, is_best=False):
         """Save model checkpoint."""
         checkpoint = {
@@ -208,9 +320,11 @@ class BoundaryTrainer:
             'history': self.history
         }
         
-        # Save latest
-        latest_path = self.save_dir / 'latest.pth'
-        torch.save(checkpoint, latest_path)
+        # Save latest every save_every epochs
+        if epoch % self.save_every == 0:
+            latest_path = self.save_dir / 'latest.pth'
+            torch.save(checkpoint, latest_path)
+            print(f"✓ Saved latest checkpoint (epoch {epoch})")
         
         # Save best
         if is_best:
@@ -218,10 +332,11 @@ class BoundaryTrainer:
             torch.save(checkpoint, best_path)
             print(f"✓ Saved best model (epoch {epoch})")
         
-        # Save every 50 epochs
+        # Save numbered checkpoint every 50 epochs
         if epoch % 50 == 0:
             epoch_path = self.save_dir / f'checkpoint_epoch_{epoch}.pth'
             torch.save(checkpoint, epoch_path)
+            print(f"✓ Saved checkpoint_epoch_{epoch}.pth")
     
     def train(self, num_epochs):
         """Full training loop."""
@@ -240,6 +355,7 @@ class BoundaryTrainer:
             # Train
             train_loss, train_metrics = self.train_epoch(epoch)
             self.history['train_loss'].append(train_loss)
+            self.history['train_bce'].append(train_metrics.get('bce', train_loss))
             
             print(f"\nTrain - Loss: {train_loss:.4f} "
                   f"Acc: {train_metrics['accuracy']:.3f} "
@@ -249,6 +365,7 @@ class BoundaryTrainer:
             val_loss, val_metrics = self.validate(epoch)
             if val_loss is not None:
                 self.history['val_loss'].append(val_loss)
+                self.history['val_bce'].append(val_metrics.get('bce', val_loss))
                 
                 # Check if best model
                 is_best = val_loss < self.history['best_val_loss']
@@ -260,6 +377,10 @@ class BoundaryTrainer:
             
             # Save checkpoint
             self.save_checkpoint(epoch, is_best=is_best)
+            
+            # Save visualizations every epoch
+            self.plot_loss_curves(epoch)
+            self.visualize_predictions(epoch)
             
             # Save history
             with open(self.save_dir / 'history.json', 'w') as f:
@@ -307,6 +428,12 @@ def main():
                         help='Number of data loading workers')
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
                         help='Directory to save checkpoints')
+    parser.add_argument('--save_every', type=int, default=10,
+                        help='Save checkpoint every N epochs (default: 10)')
+    parser.add_argument('--augment', action='store_true',
+                        help='Use data augmentation (default: False)')
+    parser.add_argument('--samples_per_epoch', type=int, default=None,
+                        help='Number of random samples per epoch (default: None = use all images)')
     
     args = parser.parse_args()
     
@@ -320,7 +447,9 @@ def main():
         args.train_dir,
         args.val_dir,
         batch_size=args.batch_size,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        augment=args.augment,
+        samples_per_epoch=args.samples_per_epoch
     )
     
     # Create model
@@ -342,7 +471,8 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
         device=device,
-        save_dir=save_dir
+        save_dir=save_dir,
+        save_every=args.save_every
     )
     
     # Train

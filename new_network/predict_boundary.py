@@ -25,8 +25,8 @@ class BoundaryPredictor:
         """
         self.device = device
         
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Load checkpoint (weights_only=False since we trust our own checkpoints)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         # Create model (assuming default architecture)
         self.model = BoundaryUNet(in_channels=1, base_channels=32, depth=4)

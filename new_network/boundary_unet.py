@@ -137,11 +137,12 @@ class BoundaryUNet(nn.Module):
         Returns:
             boundary_logits: (N, 1, H, W) raw logits for boundary prediction
         """
-        # Initial convolution
-        x = self.init_conv(x)
+        # Initial convolution (save as first skip connection)
+        skip_init = self.init_conv(x)
         
         # Encoder with skip connections
-        skips = []
+        skips = [skip_init]
+        x = skip_init
         for down_block in self.down_blocks:
             x, skip = down_block(x)
             skips.append(skip)
@@ -149,8 +150,8 @@ class BoundaryUNet(nn.Module):
         # Bottleneck
         x = self.bottleneck(x)
         
-        # Decoder with skip connections (reverse order)
-        for up_block, skip in zip(self.up_blocks, reversed(skips)):
+        # Decoder with skip connections (skip the deepest level, use rest in reverse)
+        for up_block, skip in zip(self.up_blocks, reversed(skips[:-1])):
             x = up_block(x, skip)
         
         # Final boundary logits
