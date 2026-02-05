@@ -79,6 +79,9 @@ def make_boundary_gt(instance_mask, mean_diameter=30.0, debug=False, dilation_pi
     # connectivity=2 means 8-connectivity in 2D (includes diagonals)
     # mode='thick' creates thicker boundaries by considering all interface pixels
     boundaries = find_boundaries(dilated_mask, connectivity=2, mode='thick')
+    
+    # Thicken boundaries by 2 pixels in the outward direction
+    boundaries = binary_dilation(boundaries, iterations=2)
     boundary_map = boundaries.astype(np.float32)
     
     # Optional Gaussian smoothing for softer targets
