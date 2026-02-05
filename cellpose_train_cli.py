@@ -272,9 +272,9 @@ def main():
         total_params = sum(p.numel() for p in model.net.parameters())
         logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
         logger.info("="*60 + "\n")
-                if m.bias is not None:
-                    torch.nn.init.constant_(m.bias, 0)
-        
+    
+    # Debug: Check weight stats after initialization
+    if should_reinit:
         # Debug: Check weight stats after initialization
         logger.info("Checking logdist components weight initialization:")
         for name, param in model.net.logdist_head.named_parameters():
