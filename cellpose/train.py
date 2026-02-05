@@ -64,24 +64,11 @@ def make_boundary_gt(instance_mask, mean_diameter=30.0, debug=False, dilation_pi
         empty_mask = np.ones_like(instance_mask, dtype=bool)
         return empty_target, empty_mask
     
-    # Dilate instance masks by 2 pixels to create wider boundary regions
-    from scipy.ndimage import binary_dilation
-    dilated_mask = np.zeros_like(instance_mask)
-    for cell_id in np.unique(instance_mask):
-        if cell_id == 0:  # Skip background
-            continue
-        cell_mask = (instance_mask == cell_id)
-        dilated_cell = binary_dilation(cell_mask, iterations=2)
-        dilated_mask[dilated_cell] = cell_id
-    
     # PlantSeg approach: find_boundaries with connectivity=2 (2D) and mode='thick'
-    # Applied to dilated masks to create wider boundary regions
     # connectivity=2 means 8-connectivity in 2D (includes diagonals)
     # mode='thick' creates thicker boundaries by considering all interface pixels
-    boundaries = find_boundaries(dilated_mask, connectivity=2, mode='thick')
-    
-    # Thicken boundaries by 2 pixels in the outward direction
-    boundaries = binary_dilation(boundaries, iterations=2)
+    # Use original masks WITHOUT dilation for sharper, more precise boundaries
+    boundaries = find_boundaries(instance_mask, connectivity=2, mode='thick')
     boundary_map = boundaries.astype(np.float32)
     
     # Optional Gaussian smoothing for softer targets
@@ -179,12 +166,22 @@ def _loss_fn_seg(lbl, y, device, boundary_gt=None, boundary_pred=None, boundary_
         boundary_logits_flat = boundary_logits.view(batch_size, -1)
         boundary_target_flat = boundary_target.view(batch_size, -1)
         
-        # PlantSeg approach: standard BCE loss without pos_weight
-        # PlantSeg uses BCEWithLogitsLoss or BCEDiceLoss for boundary prediction
-        # See: https://github.com/kreshuklab/plant-seg/tree/main/plantseg/resources/training_configs
+        # Compute pos_weight to handle class imbalance
+        # With ~20% boundaries, pos_weight = 80/20 = 4.0 balances the classes
+        n_positive = boundary_target_flat.sum().item()
+        n_total = boundary_target_flat.numel()
+        n_negative = n_total - n_positive
+        pos_weight_value = n_negative / max(n_positive, 1.0)
+        
+        # Cap pos_weight to avoid extreme values
+        pos_weight_value = min(pos_weight_value, 10.0)
+        
+        # BCE loss with class balancing for highly imbalanced boundary data
         boundary_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             boundary_logits_flat, 
-            boundary_target_flat
+            boundary_target_flat,
+            pos_weight=torch.tensor([pos_weight_value], device=device),
+            reduction='mean'
         )
         
         loss = loss + lambda_boundary * boundary_loss
@@ -647,24 +644,32 @@ def train_seg(net, train_data=None, train_labels=None, train_files=None,
         boundary_lr = 1e-4  # Reduced from 5e-4 to avoid saturation
         
         # Separate parameters for boundary head components vs rest of network
-        boundary_params = list(net.logdist_head.parameters()) + list(net.upsample_logdist.parameters())
+        # Only include parameters that require gradients (respects freezing)
+        boundary_params = [p for p in net.logdist_head.parameters() if p.requires_grad] + \
+                         [p for p in net.upsample_logdist.parameters() if p.requires_grad]
         boundary_param_ids = set(id(p) for p in boundary_params)
-        backbone_params = [p for p in net.parameters() if id(p) not in boundary_param_ids]
+        backbone_params = [p for p in net.parameters() if id(p) not in boundary_param_ids and p.requires_grad]
         
-        param_groups = [
-            {'params': backbone_params, 'lr': backbone_lr},
-            {'params': boundary_params, 'lr': boundary_lr}
-        ]
+        # Build param groups only with trainable parameters
+        param_groups = []
+        if len(backbone_params) > 0:
+            param_groups.append({'params': backbone_params, 'lr': backbone_lr})
+        if len(boundary_params) > 0:
+            param_groups.append({'params': boundary_params, 'lr': boundary_lr})
         
         train_logger.info(
-            f">>> AdamW, backbone_lr={backbone_lr:0.6f}, boundary_lr={boundary_lr:0.5f}, weight_decay={weight_decay:0.5f}"
+            f">>> AdamW, backbone_params={len(backbone_params)}, boundary_params={len(boundary_params)}, "
+            f"backbone_lr={backbone_lr:0.6f}, boundary_lr={boundary_lr:0.5f}, weight_decay={weight_decay:0.5f}"
         )
         optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
     else:
         train_logger.info(
             f">>> SGD, learning_rate={learning_rate:0.5f}, weight_decay={weight_decay:0.5f}, momentum={momentum:0.3f}"
         )
-        optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate,
+        # Only include trainable parameters (respects freezing)
+        trainable_params = [p for p in net.parameters() if p.requires_grad]
+        train_logger.info(f">>> SGD trainable parameters: {len(trainable_params)}")
+        optimizer = torch.optim.SGD(trainable_params, lr=learning_rate,
                                     weight_decay=weight_decay, momentum=momentum)
     
     # Store base learning rates for each param group to apply schedule as multiplier
