@@ -100,15 +100,44 @@ class BoundaryDataset(Dataset):
                      list(self.image_dir.glob('*.tiff')))
         
         # Filter out mask files
-        self.image_files = sorted([
+        candidate_images = sorted([
             f for f in all_files 
             if mask_suffix not in f.stem
         ])
         
-        if len(self.image_files) == 0:
-            raise ValueError(f"No images found in {self.image_dir}")
+        # Filter to only keep images that have corresponding masks
+        self.image_files = []
+        skipped_count = 0
+        for image_path in candidate_images:
+            base_name = image_path.stem
+            mask_found = False
+            
+            # Try different mask file extensions and naming patterns
+            for ext in ['.tif', '.tiff', '.png']:
+                # Pattern 1: base_name + suffix + ext
+                candidate = self.mask_dir / f"{base_name}{mask_suffix}{ext}"
+                if candidate.exists():
+                    mask_found = True
+                    break
+                
+                # Pattern 2: base_name (without original extension) + suffix + ext
+                base_without_ext = base_name.split('.')[0] if '.' in base_name else base_name
+                candidate = self.mask_dir / f"{base_without_ext}{mask_suffix}{ext}"
+                if candidate.exists():
+                    mask_found = True
+                    break
+            
+            if mask_found:
+                self.image_files.append(image_path)
+            else:
+                skipped_count += 1
         
-        print(f"Found {len(self.image_files)} images in {self.image_dir}")
+        if len(self.image_files) == 0:
+            raise ValueError(f"No images with corresponding masks found in {self.image_dir}")
+        
+        print(f"Found {len(self.image_files)} images with masks in {self.image_dir}")
+        if skipped_count > 0:
+            print(f"Skipped {skipped_count} images without corresponding masks")
         if self.use_subdirs:
             print(f"Using subdirectory structure (images/ and masks/)")
         else:

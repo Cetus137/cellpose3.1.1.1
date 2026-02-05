@@ -254,18 +254,26 @@ def main():
     # Freeze base network if requested (only train boundary head)
     if args.freeze_base:
         logger.info("\n" + "="*60)
-        logger.info("FREEZING BASE NETWORK - Only training boundary head")
+        logger.info("FREEZING BASE NETWORK - Only training boundary head + decoder")
         logger.info("="*60)
         
         # Freeze all parameters first
         for param in model.net.parameters():
             param.requires_grad = False
         
-        # Unfreeze only logdist_head parameters
+        # Unfreeze boundary-related components (decoder + head)
+        unfrozen_modules = []
+        if hasattr(model.net, 'upsample_logdist') and model.net.upsample_logdist is not None:
+            for param in model.net.upsample_logdist.parameters():
+                param.requires_grad = True
+            unfrozen_modules.append('upsample_logdist')
+        
         if hasattr(model.net, 'logdist_head') and model.net.logdist_head is not None:
             for param in model.net.logdist_head.parameters():
                 param.requires_grad = True
-            logger.info(f"Unfroze logdist_head parameters")
+            unfrozen_modules.append('logdist_head')
+        
+        logger.info(f"Unfroze modules: {', '.join(unfrozen_modules)}")
         
         # Count trainable vs frozen parameters
         trainable_params = sum(p.numel() for p in model.net.parameters() if p.requires_grad)
