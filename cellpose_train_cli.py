@@ -129,6 +129,8 @@ def parse_args():
     # Boundary head training
     parser.add_argument('--lambda_boundary', type=float, default=1.0,
                         help='Weight for boundary probability loss (default 1.0)')
+    parser.add_argument('--freeze_base', action='store_true',
+                        help='Freeze base network (encoder/decoder) and only train boundary head')
     
     # Logging
     parser.add_argument('--verbose', action='store_true',
@@ -213,9 +215,22 @@ def main():
         nchan=2  # Standard for cellpose models
     )
     
-    # Reinitialize logdist_head AND separate decoder to prevent saturated predictions
-    # This is done ONCE here for training, not during visualization model reloads
+    # Reinitialize logdist_head ONLY if loading from a pretrained model without boundary head
+    # (i.e., starting fresh training, not continuing from checkpoint)
+    should_reinit = False
     if hasattr(model.net, 'logdist_head') and model.net.logdist_head is not None:
+        # Check if we're loading from a model that already has boundary head weights
+        # by checking if the pretrained_model path contains our custom model name pattern
+        is_continuing_training = 'cellpose_boundary' in str(args.pretrained_model)
+        
+        if not is_continuing_training:
+            logger.info("Reinitializing logdist_head for NEW training (starting from base model)")
+            should_reinit = True
+        else:
+            logger.info("Keeping existing logdist_head weights (continuing from checkpoint)")
+            should_reinit = False
+    
+    if should_reinit:
         logger.info("Reinitializing logdist_head and upsample_logdist weights for training")
         import torch
         
@@ -235,6 +250,28 @@ def main():
         for m in model.net.logdist_head.modules():
             if isinstance(m, (torch.nn.Conv2d, torch.nn.Conv3d)):
                 torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+    
+    # Freeze base network if requested (only train boundary head)
+    if args.freeze_base:
+        logger.info("\n" + "="*60)
+        logger.info("FREEZING BASE NETWORK - Only training boundary head")
+        logger.info("="*60)
+        
+        # Freeze all parameters first
+        for param in model.net.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze only logdist_head parameters
+        if hasattr(model.net, 'logdist_head') and model.net.logdist_head is not None:
+            for param in model.net.logdist_head.parameters():
+                param.requires_grad = True
+            logger.info(f"Unfroze logdist_head parameters")
+        
+        # Count trainable vs frozen parameters
+        trainable_params = sum(p.numel() for p in model.net.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.net.parameters())
+        logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.1f}%)")
+        logger.info("="*60 + "\n")
                 if m.bias is not None:
                     torch.nn.init.constant_(m.bias, 0)
         

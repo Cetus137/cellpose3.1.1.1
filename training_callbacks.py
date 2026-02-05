@@ -134,12 +134,14 @@ class TrainingVisualizer:
             )
             
             # Run prediction with boundary extraction enabled
+            # IMPORTANT: normalize=True ensures consistent preprocessing with training
             masks_pred, flows_pred, _ = eval_model.eval(
                 self.val_image,
                 channels=self.channels,
                 diameter=30.0,
                 flow_threshold=0.4,
                 cellprob_threshold=0.0,
+                normalize=True,  # Explicit: use same normalization as training
                 return_boundary=True,
                 bsize=256
             )

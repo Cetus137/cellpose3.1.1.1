@@ -179,17 +179,12 @@ def _loss_fn_seg(lbl, y, device, boundary_gt=None, boundary_pred=None, boundary_
         boundary_logits_flat = boundary_logits.view(batch_size, -1)
         boundary_target_flat = boundary_target.view(batch_size, -1)
         
-        # Compute data-driven class weighting (handle class imbalance)
-        n_positive = boundary_target_flat.sum().item()
-        n_total = boundary_target_flat.numel()
-        n_negative = n_total - n_positive
-        pos_weight_value = n_negative / max(n_positive, 1.0)
-        
-        # PlantSeg approach: BCE loss with positive class weighting
+        # PlantSeg approach: standard BCE loss without pos_weight
+        # PlantSeg uses BCEWithLogitsLoss or BCEDiceLoss for boundary prediction
+        # See: https://github.com/kreshuklab/plant-seg/tree/main/plantseg/resources/training_configs
         boundary_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             boundary_logits_flat, 
-            boundary_target_flat,
-            pos_weight=torch.tensor([pos_weight_value], device=device)
+            boundary_target_flat
         )
         
         loss = loss + lambda_boundary * boundary_loss
