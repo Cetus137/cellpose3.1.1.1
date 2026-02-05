@@ -140,59 +140,48 @@ class make_style(nn.Module):
 
 class LogDistHead(nn.Module):
     """
-    Distance regression head for boundary detection.
+    Boundary segmentation head matching PlantSeg architecture exactly.
     
-    Predicts normalized linear distance in [0,1] from decoder features.
-    Uses unsigned distance transform (min of interior and exterior distances).
+    PlantSeg uses a simple 1x1 convolution on the final decoder output to predict boundaries.
+    The decoder output already contains spatial information from UNet skip connections.
+    
+    Based on: https://github.com/kreshuklab/plant-seg
+    Reference: Wolny et al. (2020) "Accurate and versatile 3D segmentation of plant tissues at cellular resolution"
+    
+    PlantSeg architecture:
+        self.final_conv = nn.Conv2d(f_maps[0], out_channels, 1)
+    
+    Where f_maps[0] is the decoder output channels.
     
     Args:
-        in_channels (int): Number of input channels from decoder
-        conv_3D (bool): Whether to use 3D convolutions
+        decoder_channels (int): Number of input channels from decoder
+        encoder_channels (int): Unused, kept for API compatibility
+        conv_3D (bool): Whether to use 3D convolutions (default: False)
     """
     
     def __init__(self, decoder_channels, encoder_channels, conv_3D=False):
         super().__init__()
         conv_layer = nn.Conv3d if conv_3D else nn.Conv2d
-        norm_layer = nn.BatchNorm3d if conv_3D else nn.BatchNorm2d
         
-        # Combine decoder features (semantic) with encoder features (spatial detail)
-        # Skip connection from encoder preserves sharp boundary information
-        combined_channels = decoder_channels + encoder_channels
-        hidden = max(combined_channels // 2, 64)
-        
-        self.head = nn.Sequential(
-            conv_layer(combined_channels, hidden, kernel_size=3, padding=1),
-            norm_layer(hidden),
-            nn.ReLU(inplace=True),
-            conv_layer(hidden, hidden // 2, kernel_size=3, padding=1),
-            norm_layer(hidden // 2),
-            nn.ReLU(inplace=True),
-            conv_layer(hidden // 2, 1, kernel_size=1),  # Output raw logits (no activation)
-            # NO Sigmoid here! BCE_with_logits expects raw logits
-        )
+        # PlantSeg architecture: Simple 1x1 convolution (final_conv)
+        # Input: decoder output only (already has spatial info from UNet skips)
+        # Output: boundary logits
+        self.head = conv_layer(decoder_channels, 1, kernel_size=1)
+        # NO Sigmoid! BCEWithLogitsLoss expects raw logits
     
-    def forward(self, decoder_features, encoder_features):
-        """Returns (N, 1, H, W) raw distance predictions (unbounded linear output)."""
-        # Debug: Check feature magnitudes to see if skip is being used
-        if self.training and torch.rand(1).item() < 0.01:  # 1% of batches
-            dec_mean = decoder_features.abs().mean().item()
-            enc_mean = encoder_features.abs().mean().item()
-            print(f"[SkipConnection DEBUG] decoder_features: mean_abs={dec_mean:.4f}, "
-                  f"encoder_features: mean_abs={enc_mean:.4f}, ratio={dec_mean/enc_mean:.2f}")
+    def forward(self, decoder_features, encoder_features=None):
+        """
+        Forward pass using only decoder features (PlantSeg approach).
         
-        # Concatenate decoder (semantic) with encoder (spatial detail)
-        combined = torch.cat([decoder_features, encoder_features], dim=1)
-        
-        # Return raw linear output (no sigmoid) for regression training
-        output = self.head(combined)
-        
-        # Debug: Check output values
-        if self.training and torch.rand(1).item() < 0.01:  # 1% of batches
-            print(f"[LogDistHead DEBUG] raw_output: mean={output.mean().item():.4f}, "
-                  f"std={output.std().item():.4f}, "
-                  f"min={output.min().item():.4f}, max={output.max().item():.4f}")
-        
-        return output
+        Args:
+            decoder_features: Decoder output features (B, C_dec, H, W)
+            encoder_features: Ignored, kept for API compatibility
+            
+        Returns:
+            Boundary logits (B, 1, H, W) - raw unbounded values for BCEWithLogitsLoss
+        """
+        # PlantSeg: Simple 1x1 conv on decoder output
+        return self.head(decoder_features)
 
 
 class upsample(nn.Module):

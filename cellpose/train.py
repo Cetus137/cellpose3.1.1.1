@@ -16,93 +16,92 @@ import logging
 train_logger = logging.getLogger(__name__)
 
 
-def make_boundary_gt(instance_mask, mean_diameter=30.0, debug=False, dilation_pixels=5, smooth_sigma=2.0):
+def make_boundary_gt(instance_mask, mean_diameter=30.0, debug=False, dilation_pixels=None, smooth_sigma=0.0):
     """
-    Generate binary boundary ring ground truth from cell core masks.
+    Generate boundary ground truth using PlantSeg's find_boundaries approach.
+    
+    Based on PlantSeg's StandardLabelToBoundary transformation:
+    https://github.com/kreshuklab/plant-seg
+    
+    Uses scikit-image's find_boundaries with connectivity=2 and mode='thick'
+    for robust boundary detection specialized for biological segmentation.
     
     Strategy:
-    1. For each cell instance, dilate by fixed number of pixels
-    2. Boundary = dilated AND NOT original (creates outer ring only)
-    3. Combine all boundaries into single binary map
-    4. Apply Gaussian smoothing for softer targets
+    1. Use find_boundaries(connectivity=2, mode='thick') to detect boundaries
+    2. Optionally apply Gaussian smoothing for softer targets
+    3. Return binary boundary map as training target
     
     Args:
         instance_mask (numpy.ndarray): Instance mask (H, W) with unique integer per cell (0=background)
         mean_diameter (float): Mean cell diameter (unused, kept for API compatibility)
         debug (bool): Print debug info
-        dilation_pixels (int): Number of pixels to dilate for boundary ring (default: 5)
-        smooth_sigma (float): Gaussian smoothing sigma for boundary GT (default: 2.0)
+        dilation_pixels (int): Unused, kept for API compatibility (PlantSeg uses find_boundaries instead)
+        smooth_sigma (float): Gaussian smoothing sigma for boundary GT (default: 0.0 for no smoothing)
     
     Returns:
         tuple: (boundary_map, training_mask)
-            - boundary_map (numpy.ndarray): Smoothed boundary map in [0,1], shape (H, W), dtype float32
-                                            1.0 = boundary center, 0.0 = far from boundary
+            - boundary_map (numpy.ndarray): Boundary map in [0,1], shape (H, W), dtype float32
+                                            1.0 = boundary, 0.0 = no boundary
             - training_mask (numpy.ndarray): Boolean mask for training area (all True), shape (H, W), dtype bool
     """
-    from scipy.ndimage import binary_dilation, binary_erosion, gaussian_filter
+    from skimage.segmentation import find_boundaries
+    from scipy.ndimage import gaussian_filter
     
     # Debug: check input
     if debug:
-        print(f"[make_boundary_gt] INPUT: shape={instance_mask.shape}, dtype={instance_mask.dtype}, min={instance_mask.min()}, max={instance_mask.max()}, unique={len(np.unique(instance_mask))}")
+        print(f"[make_boundary_gt] INPUT: shape={instance_mask.shape}, dtype={instance_mask.dtype}, "
+              f"min={instance_mask.min()}, max={instance_mask.max()}, unique={len(np.unique(instance_mask))}")
     
     if instance_mask.size == 0:
         print(f"WARNING: make_boundary_gt received empty mask")
         empty_target = np.zeros_like(instance_mask, dtype=np.float32)
-        empty_mask = np.ones_like(instance_mask, dtype=bool)  # Train everywhere (all zeros)
+        empty_mask = np.ones_like(instance_mask, dtype=bool)
         return empty_target, empty_mask
     
     if instance_mask.max() == 0:
         print(f"WARNING: make_boundary_gt received all-zero mask (shape={instance_mask.shape})")
         empty_target = np.zeros_like(instance_mask, dtype=np.float32)
-        empty_mask = np.ones_like(instance_mask, dtype=bool)  # Train everywhere (all zeros)
+        empty_mask = np.ones_like(instance_mask, dtype=bool)
         return empty_target, empty_mask
     
-    # Initialize binary boundary map
-    boundary_map = np.zeros_like(instance_mask, dtype=bool)
-    
-    if debug:
-        print(f"[make_boundary_gt] Fixed dilation: {dilation_pixels} pixels")
-    
-    # Process each cell individually with fixed dilation
-    cell_ids = np.unique(instance_mask)
-    cell_ids = cell_ids[cell_ids > 0]  # Exclude background
-    
-    for cell_id in cell_ids:
-        # Get mask for this cell
+    # Dilate instance masks by 2 pixels to create wider boundary regions
+    from scipy.ndimage import binary_dilation
+    dilated_mask = np.zeros_like(instance_mask)
+    for cell_id in np.unique(instance_mask):
+        if cell_id == 0:  # Skip background
+            continue
         cell_mask = (instance_mask == cell_id)
-        
-        # Fixed dilation for all cells
-        dilated = binary_dilation(cell_mask, iterations=dilation_pixels)
-        
-        # Boundary ring = dilated AND NOT original (creates outer ring only)
-        boundary_ring = dilated & ~cell_mask
-        
-        # Add this cell's boundary to the combined map
-        boundary_map |= boundary_ring
+        dilated_cell = binary_dilation(cell_mask, iterations=2)
+        dilated_mask[dilated_cell] = cell_id
     
-    # Convert to float32 for training
-    boundary_map_float = boundary_map.astype(np.float32)
+    # PlantSeg approach: find_boundaries with connectivity=2 (2D) and mode='thick'
+    # Applied to dilated masks to create wider boundary regions
+    # connectivity=2 means 8-connectivity in 2D (includes diagonals)
+    # mode='thick' creates thicker boundaries by considering all interface pixels
+    boundaries = find_boundaries(dilated_mask, connectivity=2, mode='thick')
+    boundary_map = boundaries.astype(np.float32)
     
-    # Apply Gaussian smoothing for softer targets
+    # Optional Gaussian smoothing for softer targets
     if smooth_sigma > 0:
-        boundary_map_float = gaussian_filter(boundary_map_float, sigma=smooth_sigma, mode='constant', cval=0.0)
+        boundary_map = gaussian_filter(boundary_map, sigma=smooth_sigma, mode='constant', cval=0.0)
         # Renormalize to [0, 1] range after smoothing
-        if boundary_map_float.max() > 0:
-            boundary_map_float = boundary_map_float / boundary_map_float.max()
+        if boundary_map.max() > 0:
+            boundary_map = boundary_map / boundary_map.max()
     
     # Train everywhere (no masking for boundary classification)
     training_mask = np.ones_like(instance_mask, dtype=bool)
     
     if debug:
-        n_boundary = boundary_map.sum()
+        n_boundary = boundaries.sum()
         n_total = instance_mask.size
         n_cells = (instance_mask > 0).sum()
         boundary_fraction = n_boundary / max(n_cells, 1) if n_cells > 0 else 0
-        print(f"[make_boundary_gt] Boundary pixels (before smoothing): {n_boundary}/{n_total} ({100*n_boundary/n_total:.2f}%)")
-        print(f"[make_boundary_gt] After smoothing: min={boundary_map_float.min():.3f}, max={boundary_map_float.max():.3f}, mean={boundary_map_float.mean():.3f}")
+        print(f"[make_boundary_gt] Boundary pixels (find_boundaries): {n_boundary}/{n_total} ({100*n_boundary/n_total:.2f}%)")
+        print(f"[make_boundary_gt] After smoothing: min={boundary_map.min():.3f}, "
+              f"max={boundary_map.max():.3f}, mean={boundary_map.mean():.3f}")
         print(f"[make_boundary_gt] Boundary fraction within cells: {100*boundary_fraction:.1f}%")
     
-    return boundary_map_float, training_mask
+    return boundary_map, training_mask
 
 
 def soft_dice_loss(pred_probs, target, smooth=1e-6):
@@ -127,7 +126,17 @@ def _loss_fn_seg(lbl, y, device, boundary_gt=None, boundary_pred=None, boundary_
     """
     Calculates the loss function between true labels lbl and prediction y.
     
-    Now uses binary boundary classification with BCE + Dice loss.
+    Boundary prediction approach inspired by PlantSeg (Wolny et al., 2020):
+    https://github.com/kreshuklab/plant-seg
+    
+    PlantSeg uses BCEWithLogitsLoss for boundary prediction with boundaries
+    detected using find_boundaries(connectivity=2, mode='thick') from scikit-image.
+    This approach is specialized for biological cell segmentation.
+    
+    Our boundary loss combines:
+    - BCE loss with pos_weight (handles class imbalance)
+    - Soft Dice loss (overlap maximization)  
+    - Gradient smoothness penalty (spatial coherence)
     
     Args:
         lbl (numpy.ndarray): True labels (cellprob, flowsY, flowsX).
@@ -151,7 +160,7 @@ def _loss_fn_seg(lbl, y, device, boundary_gt=None, boundary_pred=None, boundary_
     cellprob_loss = criterion2(y[:, -1], torch.from_numpy(lbl[:, 0] > 0.5).to(device).float())
     loss = flow_loss + cellprob_loss
     
-    # Boundary probability classification with BCE + Dice
+    # Boundary classification using BCEWithLogitsLoss (PlantSeg approach)
     boundary_loss = torch.tensor(0.0, device=device)
     if boundary_gt is not None and boundary_pred is not None:
         boundary_target = torch.from_numpy(boundary_gt).to(device).float()
@@ -167,60 +176,18 @@ def _loss_fn_seg(lbl, y, device, boundary_gt=None, boundary_pred=None, boundary_
         boundary_logits_flat = boundary_logits.view(batch_size, -1)
         boundary_target_flat = boundary_target.view(batch_size, -1)
         
-        # Compute data-driven class weighting
+        # Compute data-driven class weighting (handle class imbalance)
         n_positive = boundary_target_flat.sum().item()
         n_total = boundary_target_flat.numel()
         n_negative = n_total - n_positive
         pos_weight_value = n_negative / max(n_positive, 1.0)
         
-        # BCE loss with data-driven positive class weighting
-        bce_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        # PlantSeg approach: BCE loss with positive class weighting
+        boundary_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             boundary_logits_flat, 
             boundary_target_flat,
             pos_weight=torch.tensor([pos_weight_value], device=device)
         )
-        
-        # Soft Dice loss (need probabilities, not logits)
-        boundary_probs = torch.sigmoid(boundary_logits_flat)
-        dice_coef = soft_dice_loss(boundary_probs, boundary_target_flat)
-        dice_loss = 1.0 - dice_coef
-        
-        # Gradient smoothness regularizer: penalize large spatial gradients
-        # Compute probability map in 2D: (N, H, W)
-        boundary_probs_2d = torch.sigmoid(boundary_logits)
-        
-        # Compute spatial gradients using finite differences
-        # ∂x: difference along width (dim=2)
-        grad_x = boundary_probs_2d[:, :, 1:] - boundary_probs_2d[:, :, :-1]
-        # ∂y: difference along height (dim=1)
-        grad_y = boundary_probs_2d[:, 1:, :] - boundary_probs_2d[:, :-1, :]
-        
-        # L2 gradient smoothness: mean((∂x)² + (∂y)²)
-        smooth_loss = (grad_x ** 2).mean() + (grad_y ** 2).mean()
-        
-        # Combined loss: BCE + 0.3 * Dice + 0.01 * Smoothness
-        boundary_loss = bce_loss + 0.3 * dice_loss + 0.01 * smooth_loss
-        
-        # Enhanced monitoring: check for collapse and saturation
-        pred_std = boundary_probs.std().item()
-        pred_mean = boundary_probs.mean().item()
-        target_mean = boundary_target_flat.mean().item()
-        pct_positive = (boundary_probs > 0.5).float().mean().item()
-        
-        # Logit statistics for saturation detection
-        logit_mean = boundary_logits_flat.mean().item()
-        logit_std = boundary_logits_flat.std().item()
-        logit_saturated = (boundary_logits_flat.abs() > 4.0).float().mean().item()
-        
-        # Warnings
-        if pred_std < 0.02:
-            print(f"WARNING: Boundary prediction collapsed! std={pred_std:.6f}, mean={pred_mean:.4f}")
-            print(f"  target mean={target_mean:.4f} ({100*target_mean:.2f}% boundary pixels)")
-            print(f"  BCE={bce_loss.item():.4f}, Dice={dice_loss.item():.4f}, pct>0.5={100*pct_positive:.2f}%")
-        
-        if logit_saturated > 0.5:
-            print(f"WARNING: Logits saturating! {100*logit_saturated:.1f}% pixels with |logit| > 4")
-            print(f"  logit mean={logit_mean:.3f}, std={logit_std:.3f}")
         
         loss = loss + lambda_boundary * boundary_loss
     
