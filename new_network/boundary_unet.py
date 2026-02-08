@@ -89,17 +89,24 @@ class BoundaryUNet(nn.Module):
     """
     Standalone U-Net for boundary detection.
     
+    Supports both 2D and 2.5D processing:
+    - 2D: Single slice (in_channels=1)
+    - 2.5D: Context window of z-slices (e.g., in_channels=5 for ±2 slices)
+    
     Args:
-        in_channels: Number of input channels (1 for grayscale, 3 for RGB)
+        in_channels: Number of input channels
+                    - 1 for single slice (2D)
+                    - N for 2.5D with N-slice z-context window
+                    - 3 for RGB images
         base_channels: Base number of channels (doubled at each downsampling)
         depth: Number of downsampling/upsampling blocks
     
     Architecture:
-        Input (H, W) -> 
+        Input (N, in_channels, H, W) -> 
         Encoder [32 -> 64 -> 128 -> 256] ->
         Bottleneck [512] ->
         Decoder [256 -> 128 -> 64 -> 32] ->
-        Output (H, W) boundary logits
+        Output (N, 1, H, W) boundary logits
     """
     def __init__(self, in_channels=1, base_channels=32, depth=4):
         super().__init__()

@@ -6,6 +6,10 @@ Trains a standalone boundary detection network using:
 - AdamW optimizer with cosine annealing
 - Validation monitoring
 - Model checkpointing
+
+Supports both 2D and 2.5D data:
+- Auto-detects input channels from data (1 for 2D, N for 2.5D)
+- Maintains backward compatibility
 """
 
 import torch
@@ -254,30 +258,46 @@ class BoundaryTrainer:
         loader = self.val_loader if self.val_loader is not None else self.train_loader
         dataset_name = "Validation" if self.val_loader is not None else "Training"
         
-        # Get random batch
-        import random
-        batch_idx = random.randint(0, len(loader) - 1)
-        for i, batch in enumerate(loader):
-            if i == batch_idx:
-                break
+        # Randomly sample 3 different images from the dataset
+        n_show = 3
+        dataset = loader.dataset
+        indices = np.random.choice(len(dataset), size=min(n_show, len(dataset)), replace=False)
         
-        images = batch['image'].to(self.device)
-        boundary_gt = batch['boundary_gt'].to(self.device)
-        filenames = batch['filename']
+        # Collect samples
+        images_list = []
+        boundary_gt_list = []
+        filenames_list = []
+        
+        for idx in indices:
+            sample = dataset[idx]
+            images_list.append(sample['image'])
+            boundary_gt_list.append(sample['boundary_gt'])
+            filenames_list.append(sample['filename'])
+        
+        # Stack into batch
+        images = torch.stack(images_list).to(self.device)
+        boundary_gt = torch.stack(boundary_gt_list).to(self.device)
+        filenames = filenames_list
+        
+        print(f"Visualizing {len(filenames)} random samples: {filenames}")
         
         with torch.no_grad():
             logits = self.model(images)
             boundary_pred = torch.sigmoid(logits)
         
-        # Convert to numpy and take first 3 images in batch
-        n_show = min(3, images.shape[0])
+        n_show = len(filenames)
         
         fig, axes = plt.subplots(n_show, 4, figsize=(16, 4*n_show))
         if n_show == 1:
             axes = axes.reshape(1, -1)
         
         for i in range(n_show):
-            img = images[i, 0].cpu().numpy()
+            # For 2.5D, show center slice; for 2D, show the single channel
+            if images.shape[1] > 1:  # Multi-channel (2.5D)
+                center_idx = images.shape[1] // 2
+                img = images[i, center_idx].cpu().numpy()
+            else:  # Single channel (2D)
+                img = images[i, 0].cpu().numpy()
             gt = boundary_gt[i, 0].cpu().numpy()
             pred = boundary_pred[i, 0].cpu().numpy()
             pred_binary = (pred > 0.5).astype(np.float32)
@@ -404,8 +424,8 @@ def main():
                         help='Path to validation data directory')
     
     # Model
-    parser.add_argument('--in_channels', type=int, default=1,
-                        help='Number of input channels (1=grayscale, 3=RGB)')
+    parser.add_argument('--in_channels', type=str, default='auto',
+                        help='Number of input channels (auto=detect from data, or specify 1, 3, 5, etc.)')
     parser.add_argument('--base_channels', type=int, default=32,
                         help='Base number of channels')
     parser.add_argument('--depth', type=int, default=4,
@@ -452,10 +472,24 @@ def main():
         samples_per_epoch=args.samples_per_epoch
     )
     
+    # Detect input channels from data if auto
+    if args.in_channels == 'auto':
+        # Get a sample batch to determine input channels
+        sample_batch = next(iter(train_loader))
+        in_channels = sample_batch['image'].shape[1]
+        print(f"Auto-detected {in_channels} input channels from data")
+        if in_channels == 1:
+            print("  -> 2D mode (single slice per sample)")
+        else:
+            print(f"  -> 2.5D mode ({in_channels}-slice z-context window)")
+    else:
+        in_channels = int(args.in_channels)
+        print(f"Using {in_channels} input channels (specified)")
+    
     # Create model
     print("\nInitializing BoundaryUNet...")
     model = BoundaryUNet(
-        in_channels=args.in_channels,
+        in_channels=in_channels,
         base_channels=args.base_channels,
         depth=args.depth
     )

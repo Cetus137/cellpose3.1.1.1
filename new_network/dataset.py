@@ -3,6 +3,13 @@ Dataset and data loading utilities for boundary detection.
 
 Loads images and instance masks, generates boundary ground truth
 using PlantSeg-inspired approach.
+
+Supports both 2D and 2.5D data:
+- 2D: Images and masks with shape (H, W)
+- 2.5D: Images and masks with shape (C, H, W) where C is the z-context window
+        (e.g., C=5 for ±2 adjacent slices around the center slice)
+
+The dataset automatically detects the input format and handles both cases.
 """
 
 import numpy as np
@@ -49,11 +56,14 @@ class BoundaryDataset(Dataset):
     Dataset for boundary detection training.
     
     Loads image-mask pairs and generates boundary ground truth on-the-fly.
+    Automatically handles both 2D and 2.5D data formats:
+    - 2D: Images/masks with shape (H, W)
+    - 2.5D: Images/masks with shape (C, H, W) for z-context
     
     Directory structure (Cellpose-style):
         data_dir/
-            img_001.tif
-            img_001_masks.tif
+            img_001.tif          # Can be (H, W) or (C, H, W)
+            img_001_masks.tif    # Same shape as image
             img_002.tif
             img_002_masks.tif
             ...
@@ -76,6 +86,7 @@ class BoundaryDataset(Dataset):
             transform: Optional transforms
             augment: Whether to apply data augmentation
         """
+        self.is_2_5d = None  # Will be detected from first sample
         self.data_dir = Path(data_dir)
         self.mask_suffix = mask_suffix
         self.transform = transform
@@ -176,22 +187,54 @@ class BoundaryDataset(Dataset):
         
         mask = io.imread(str(mask_path))
         
-        # Ensure 2D
-        if image.ndim == 3:
-            # Check if it's (C, H, W) format with C=1
-            if image.shape[0] == 1:
-                image = image[0]  # Take first channel: (1, H, W) -> (H, W)
+        # Handle 2D vs 2.5D format
+        # Detect format from first sample
+        if self.is_2_5d is None:
+            if image.ndim == 3 and image.shape[0] <= 32:  # Assume (C, H, W) if C is small
+                self.is_2_5d = True
+                print(f"Detected 2.5D data format with {image.shape[0]} context slices")
             else:
-                image = image.mean(axis=-1)  # Convert RGB to grayscale: (H, W, C) -> (H, W)
-        if mask.ndim == 3:
-            # Check if it's (C, H, W) format with C=1
-            if mask.shape[0] == 1:
-                mask = mask[0]  # Take first channel: (1, H, W) -> (H, W)
-            else:
-                mask = mask[:, :, 0]  # Take first channel: (H, W, C) -> (H, W)
+                self.is_2_5d = False
+                print(f"Detected 2D data format")
         
-        # Generate boundary ground truth
-        boundary_gt = make_boundary_gt(mask)
+        # Process based on detected format
+        if self.is_2_5d:
+            # Expected format: (C, H, W) for both image and mask
+            if image.ndim == 2:
+                raise ValueError(f"Expected 2.5D data (C, H, W) but got 2D image: {image.shape}")
+            if mask.ndim == 2:
+                raise ValueError(f"Expected 2.5D data (C, H, W) but got 2D mask: {mask.shape}")
+            
+            # Verify shapes match
+            if image.shape != mask.shape:
+                raise ValueError(f"Image shape {image.shape} does not match mask shape {mask.shape}")
+            
+            # For 2.5D, generate boundary from center slice
+            center_idx = image.shape[0] // 2
+            boundary_gt = make_boundary_gt(mask[center_idx])
+            
+        else:
+            # 2D mode: Ensure single channel
+            if image.ndim == 3:
+                # Check if it's (C, H, W) format with C=1
+                if image.shape[0] == 1:
+                    image = image[0]  # Take first channel: (1, H, W) -> (H, W)
+                elif image.shape[2] <= 4:  # Likely (H, W, C) RGB format
+                    image = image.mean(axis=-1)  # Convert RGB to grayscale: (H, W, C) -> (H, W)
+                else:
+                    image = image[0]  # Assume (C, H, W), take first
+                    
+            if mask.ndim == 3:
+                # Check if it's (C, H, W) format with C=1
+                if mask.shape[0] == 1:
+                    mask = mask[0]  # Take first channel: (1, H, W) -> (H, W)
+                elif mask.shape[2] <= 4:  # Likely (H, W, C) format
+                    mask = mask[:, :, 0]  # Take first channel: (H, W, C) -> (H, W)
+                else:
+                    mask = mask[0]  # Assume (C, H, W), take first
+            
+            # Generate boundary ground truth
+            boundary_gt = make_boundary_gt(mask)
         
         # Apply augmentation
         if self.augment:
@@ -209,7 +252,13 @@ class BoundaryDataset(Dataset):
         boundary_gt = np.ascontiguousarray(boundary_gt.astype(np.float32))
         
         # Convert to tensors
-        image = torch.from_numpy(image).unsqueeze(0).float()  # (1, H, W)
+        if self.is_2_5d:
+            # Already (C, H, W) format
+            image = torch.from_numpy(image).float()  # (C, H, W)
+        else:
+            # Add channel dimension for 2D
+            image = torch.from_numpy(image).unsqueeze(0).float()  # (1, H, W)
+        
         boundary_gt = torch.from_numpy(boundary_gt).unsqueeze(0).float()  # (1, H, W)
         
         # Debug final tensor shapes
@@ -224,21 +273,35 @@ class BoundaryDataset(Dataset):
         }
     
     def _augment(self, image, boundary):
-        """Simple data augmentation: flips and rotations."""
+        """
+        Simple data augmentation: flips and rotations.
+        
+        Handles both 2D (H, W) and 2.5D (C, H, W) formats.
+        For 2.5D, applies the same transformation to all z-slices.
+        """
         # Random horizontal flip
         if random.random() > 0.5:
-            image = np.fliplr(image)
+            if image.ndim == 3:  # 2.5D: (C, H, W)
+                image = np.flip(image, axis=2)  # Flip width
+            else:  # 2D: (H, W)
+                image = np.fliplr(image)
             boundary = np.fliplr(boundary)
         
         # Random vertical flip
         if random.random() > 0.5:
-            image = np.flipud(image)
+            if image.ndim == 3:  # 2.5D: (C, H, W)
+                image = np.flip(image, axis=1)  # Flip height
+            else:  # 2D: (H, W)
+                image = np.flipud(image)
             boundary = np.flipud(boundary)
         
         # Random 90-degree rotation
         k = random.randint(0, 3)
         if k > 0:
-            image = np.rot90(image, k)
+            if image.ndim == 3:  # 2.5D: (C, H, W)
+                image = np.rot90(image, k, axes=(1, 2))  # Rotate H, W axes
+            else:  # 2D: (H, W)
+                image = np.rot90(image, k)
             boundary = np.rot90(boundary, k)
         
         return image, boundary
