@@ -27,27 +27,41 @@ class CentreDataset3D(Dataset):
         patch_size=(256, 128, 128),
         augment=True,
         center_sigma=5.0,
-        patches_per_volume=10
+        patches_per_volume=10,
+        mask_suffix="_masks.tif",
+        image_files=None
     ):
         """
         Args:
-            data_dir: Directory containing normalized volumes and GT masks
+            data_dir: Directory containing volumes and masks
             patch_size: (D, H, W) size of extracted patches
             augment: Whether to apply data augmentation
             center_sigma: Gaussian sigma for center targets (in pixels)
             patches_per_volume: Number of random patches to extract per volume per epoch
+            mask_suffix: Suffix for mask files (e.g., "_masks.tif" or "_GT.tif")
+            image_files: Optional list of specific image files to use (for splitting)
         """
         self.data_dir = Path(data_dir)
         self.patch_size = patch_size
         self.augment = augment
         self.center_sigma = center_sigma
         self.patches_per_volume = patches_per_volume
+        self.mask_suffix = mask_suffix
         
         # Find all image files
-        self.image_files = sorted(self.data_dir.glob('*_normalized.tif'))
+        if image_files is not None:
+            # Use provided file list (for train/val split)
+            self.image_files = sorted([Path(f) for f in image_files])
+        else:
+            # Auto-detect: try _normalized.tif first, then all .tif files
+            self.image_files = sorted(self.data_dir.glob('*_normalized.tif'))
+            if len(self.image_files) == 0:
+                # Fall back to all .tif files that aren't masks
+                all_tifs = sorted(self.data_dir.glob('*.tif'))
+                self.image_files = [f for f in all_tifs if not f.name.endswith(mask_suffix)]
         
         if len(self.image_files) == 0:
-            raise ValueError(f"No normalized images found in {data_dir}")
+            raise ValueError(f"No image files found in {data_dir}")
         
         print(f"Found {len(self.image_files)} volumes in {data_dir}")
         
@@ -61,11 +75,16 @@ class CentreDataset3D(Dataset):
         """Load image and GT mask for a volume."""
         image_path = self.image_files[volume_idx]
         
-        # Construct GT mask path
-        gt_path = image_path.parent / image_path.name.replace('_normalized.tif', '_GT.tif')
+        # Construct mask path based on suffix
+        # Remove .tif extension and add mask suffix
+        base_name = image_path.stem
+        # Handle _normalized naming
+        if base_name.endswith('_normalized'):
+            base_name = base_name[:-11]  # Remove '_normalized'
+        gt_path = image_path.parent / (base_name + self.mask_suffix)
         
         if not gt_path.exists():
-            raise FileNotFoundError(f"GT mask not found: {gt_path}")
+            raise FileNotFoundError(f"Mask not found: {gt_path}. Expected naming: image.tif -> image{self.mask_suffix}")
         
         # Load volumes
         image = tifffile.imread(image_path).astype(np.float32)

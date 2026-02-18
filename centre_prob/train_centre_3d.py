@@ -17,38 +17,91 @@ from centre_unet_3d import CentreUNet3D
 from dataset_3d import CentreDataset3D
 
 
-def get_dataloaders(train_dir, val_dir, batch_size=2, patch_size=(256, 128, 128),
-                   center_sigma=5.0, patches_per_volume=10, num_workers=4):
+def get_dataloaders(train_dir, val_dir=None, val_split=0.2, batch_size=2, 
+                   patch_size=(256, 128, 128), center_sigma=5.0, 
+                   patches_per_volume=10, num_workers=4, mask_suffix="_masks.tif"):
     """
     Create train and validation dataloaders.
     
     Args:
-        train_dir: Training data directory
-        val_dir: Validation data directory
+        train_dir: Training data directory (or single data directory if val_dir is None)
+        val_dir: Validation data directory (optional, if None will auto-split)
+        val_split: Validation split ratio if auto-splitting (default 0.2)
         batch_size: Batch size
         patch_size: (D, H, W) patch size
         center_sigma: Gaussian sigma for center targets
         patches_per_volume: Patches per volume per epoch
         num_workers: Number of dataloader workers
+        mask_suffix: Suffix for mask files (e.g., "_masks.tif" or "_GT.tif")
     
     Returns:
         train_loader, val_loader
     """
-    train_dataset = CentreDataset3D(
-        data_dir=train_dir,
-        patch_size=patch_size,
-        augment=True,
-        center_sigma=center_sigma,
-        patches_per_volume=patches_per_volume
-    )
-    
-    val_dataset = CentreDataset3D(
-        data_dir=val_dir,
-        patch_size=patch_size,
-        augment=False,
-        center_sigma=center_sigma,
-        patches_per_volume=max(1, patches_per_volume // 2)  # Fewer patches for val (min 1)
-    )
+    if val_dir is None:
+        # Auto-split: load all files and split them
+        from pathlib import Path
+        import random
+        
+        data_path = Path(train_dir)
+        # Auto-detect image files
+        image_files = sorted(data_path.glob('*_normalized.tif'))
+        if len(image_files) == 0:
+            # Fall back to all .tif files that aren't masks
+            all_tifs = sorted(data_path.glob('*.tif'))
+            image_files = [f for f in all_tifs if not f.name.endswith(mask_suffix)]
+        
+        if len(image_files) == 0:
+            raise ValueError(f"No image files found in {train_dir}")
+        
+        # Shuffle and split
+        random.seed(42)  # For reproducibility
+        image_files_shuffled = image_files.copy()
+        random.shuffle(image_files_shuffled)
+        
+        n_val = max(1, int(len(image_files_shuffled) * val_split))
+        val_files = image_files_shuffled[:n_val]
+        train_files = image_files_shuffled[n_val:]
+        
+        print(f"Auto-split: {len(train_files)} train, {len(val_files)} val from {train_dir}")
+        
+        train_dataset = CentreDataset3D(
+            data_dir=train_dir,
+            patch_size=patch_size,
+            augment=True,
+            center_sigma=center_sigma,
+            patches_per_volume=patches_per_volume,
+            mask_suffix=mask_suffix,
+            image_files=train_files
+        )
+        
+        val_dataset = CentreDataset3D(
+            data_dir=train_dir,
+            patch_size=patch_size,
+            augment=False,
+            center_sigma=center_sigma,
+            patches_per_volume=max(1, patches_per_volume // 2),
+            mask_suffix=mask_suffix,
+            image_files=val_files
+        )
+    else:
+        # Use separate directories
+        train_dataset = CentreDataset3D(
+            data_dir=train_dir,
+            patch_size=patch_size,
+            augment=True,
+            center_sigma=center_sigma,
+            patches_per_volume=patches_per_volume,
+            mask_suffix=mask_suffix
+        )
+        
+        val_dataset = CentreDataset3D(
+            data_dir=val_dir,
+            patch_size=patch_size,
+            augment=False,
+            center_sigma=center_sigma,
+            patches_per_volume=max(1, patches_per_volume // 2),
+            mask_suffix=mask_suffix
+        )
     
     train_loader = DataLoader(
         train_dataset,
@@ -222,8 +275,9 @@ def plot_loss_curves(train_losses, val_losses, output_dir):
 
 def train(
     train_dir,
-    val_dir,
-    output_dir,
+    val_dir=None,
+    val_split=0.2,
+    output_dir='./output',
     epochs=100,
     batch_size=2,
     learning_rate=1e-4,
@@ -235,14 +289,16 @@ def train(
     dropout_p=0.0,
     num_workers=4,
     save_every=10,
-    mixed_precision=True
+    mixed_precision=True,
+    mask_suffix="_masks.tif"
 ):
     """
     Train 3D Centre U-Net.
     
     Args:
-        train_dir: Training data directory
-        val_dir: Validation data directory
+        train_dir: Training data directory (or single data directory if val_dir is None)
+        val_dir: Validation data directory (optional, if None will auto-split)
+        val_split: Validation split ratio if auto-splitting (default 0.2)
         output_dir: Output directory for checkpoints and visualizations
         epochs: Number of training epochs
         batch_size: Batch size
@@ -256,6 +312,7 @@ def train(
         num_workers: Number of dataloader workers
         save_every: Save checkpoint every N epochs
         mixed_precision: Use mixed precision training
+        mask_suffix: Suffix for mask files (e.g., "_masks.tif" or "_GT.tif")
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -272,11 +329,13 @@ def train(
     train_loader, val_loader = get_dataloaders(
         train_dir=train_dir,
         val_dir=val_dir,
+        val_split=val_split,
         batch_size=batch_size,
         patch_size=patch_size,
         center_sigma=center_sigma,
         patches_per_volume=patches_per_volume,
-        num_workers=num_workers
+        num_workers=num_workers,
+        mask_suffix=mask_suffix
     )
     
     print(f"Train batches: {len(train_loader)}")
@@ -379,9 +438,13 @@ def main():
     
     # Data arguments
     parser.add_argument('--train_dir', type=str, required=True,
-                        help='Training data directory')
-    parser.add_argument('--val_dir', type=str, required=True,
-                        help='Validation data directory')
+                        help='Training data directory (or single data directory if --val_dir not provided)')
+    parser.add_argument('--val_dir', type=str, default=None,
+                        help='Validation data directory (optional, will auto-split if not provided)')
+    parser.add_argument('--val_split', type=float, default=0.2,
+                        help='Validation split ratio for auto-splitting (default 0.2)')
+    parser.add_argument('--mask_suffix', type=str, default='_masks.tif',
+                        help='Mask file suffix (default "_masks.tif", or use "_GT.tif")')
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Output directory')
     
@@ -422,6 +485,7 @@ def main():
     train(
         train_dir=args.train_dir,
         val_dir=args.val_dir,
+        val_split=args.val_split,
         output_dir=args.output_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -434,7 +498,8 @@ def main():
         dropout_p=args.dropout_p,
         num_workers=args.num_workers,
         save_every=args.save_every,
-        mixed_precision=not args.no_mixed_precision
+        mixed_precision=not args.no_mixed_precision,
+        mask_suffix=args.mask_suffix
     )
 
 
